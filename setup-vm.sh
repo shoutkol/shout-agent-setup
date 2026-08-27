@@ -4,7 +4,7 @@
 #  + Google Chrome + Thai fonts + Claude Desktop
 #
 #  Run as a NORMAL user (not root, not sudo):
-#      bash setup-crd-vm.sh
+#      bash setup-vm.sh
 #
 #  Idempotent: safe to re-run.
 #  After it finishes, register the CRD host manually (see printed instructions).
@@ -13,6 +13,13 @@ set -euo pipefail
 
 if [[ $EUID -eq 0 ]]; then
   echo "!! Run this as a normal user, not root/sudo. The script calls sudo itself."
+  exit 1
+fi
+
+trap 'echo -e "\n\033[1;31m!! FAILED at line $LINENO\033[0m"; exit 1' ERR
+
+if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
+  echo "!! amd64 only -- Google Chrome and Chrome Remote Desktop have no arm64 .deb"
   exit 1
 fi
 
@@ -33,6 +40,11 @@ log "2/9  XFCE desktop  (~3-5 min)"
 # XFCE over GNOME: ~400MB RAM vs ~1.5GB, and no GDM/Wayland fight with CRD.
 sudo apt-get install -y -qq xfce4 xfce4-goodies dbus-x11 xscreensaver
 
+# Claude Desktop stores its session token via the Secret Service API. Without a
+# keyring daemon it warns "Your sign-in won't be saved on this device" and makes
+# you log in again on every launch.
+sudo apt-get install -y -qq gnome-keyring libsecret-1-0 seahorse
+
 # -----------------------------------------------------------------------------
 log "3/9  Chrome Remote Desktop host"
 # -----------------------------------------------------------------------------
@@ -48,7 +60,14 @@ sudo tee /etc/chrome-remote-desktop-session > /dev/null <<'EOF'
 exec /etc/X11/Xsession /usr/bin/xfce4-session
 EOF
 
-sudo usermod -aG chrome-remote-desktop "$USER_NAME"
+# Newer CRD builds are sandboxed (_crd_network / _crd_peer_connection service
+# users) and no longer create this group at all; older builds require it.
+# Guarded so `set -e` does not abort the whole run on a missing group.
+if getent group chrome-remote-desktop >/dev/null; then
+  sudo usermod -aG chrome-remote-desktop "$USER_NAME"
+else
+  echo "   (skipped: sandboxed CRD build, no chrome-remote-desktop group)"
+fi
 
 # Keeps the user's systemd slice alive across reboots. Without this the service
 # fails on boot with: "user-XXXX.slice has 'stop' job queued".
@@ -125,10 +144,12 @@ log "8/9  Desktop shortcuts + default browser"
 # -----------------------------------------------------------------------------
 mkdir -p "$HOME/Desktop"
 
-for app in com.anthropic.Claude google-chrome; do
-  src="/usr/share/applications/${app}.desktop"
-  [[ -f "$src" ]] && cp -f "$src" "$HOME/Desktop/" && chmod +x "$HOME/Desktop/${app}.desktop"
-done
+# Claude ships as com.anthropic.Claude.desktop, not claude-desktop.desktop --
+# glob so a future rename does not silently drop the shortcut.
+while IFS= read -r src; do
+  cp -f "$src" "$HOME/Desktop/" && chmod +x "$HOME/Desktop/$(basename "$src")"
+done < <(find /usr/share/applications -maxdepth 1 \
+           \( -iname '*claude*.desktop' -o -iname 'google-chrome.desktop' \) 2>/dev/null)
 
 xdg-settings set default-web-browser google-chrome.desktop 2>/dev/null || true
 
@@ -171,6 +192,10 @@ cat <<BANNER
     sudo systemctl status chrome-remote-desktop@$USER_NAME --no-pager
     chrome            # launches Chrome, clearing any stale lock first
     claude-desktop    # or use the Desktop icon
+
+  First time you open Claude Desktop, the keyring asks for a password.
+  LEAVE IT BLANK and press OK -- otherwise you must unlock it on every
+  login, which is painful on a headless VM.
 
   Tip: once this VM works the way you want, take a Machine Image in the
   GCP console. Next time you spawn a VM you skip all of the above.
