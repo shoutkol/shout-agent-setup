@@ -3,19 +3,38 @@
 p() { printf '\n== %s\n' "$*"; }
 p host;            echo "$(hostname) / $(id -un) / $(lsb_release -ds 2>/dev/null)"
 
-# The orca CLI ships inside the app (macOS: Orca.app/Contents/Resources/bin/orca) and is
-# not on PATH until the app's "install CLI" step runs. Find it wherever the Linux build put it.
+# The orca CLI is not a binary: it is the app's Electron executable run as node on
+# resources/app.asar.unpacked/out/cli/index.js (see Orca.app/Contents/Resources/bin/orca
+# on macOS). The Linux build is an AppImage mounted at a fresh /tmp/.mount_orca-XXXXXX on
+# every launch, so nothing stable is on PATH. Resolve the mount from the running orca-ide
+# process instead -- that also guarantees the CLI matches the running app version.
 p orca binary
 if ! command -v orca >/dev/null; then
   PID=$(pgrep -o -x orca-ide || pgrep -o -f orca-ide || true)
-  [ -n "$PID" ] && echo "orca-ide pid=$PID exe=$(readlink -f /proc/$PID/exe 2>/dev/null)"
-  CANDS=$(
-    [ -n "$PID" ] && APPDIR=$(dirname "$(readlink -f /proc/$PID/exe 2>/dev/null)") && ls -d "$APPDIR"/resources/bin/orca "$APPDIR"/resources/app/bin/orca "$APPDIR"/bin/orca 2>/dev/null
-    find /opt /usr/share /usr/lib /usr/local "$HOME/.local" "$HOME/Applications" /snap -maxdepth 7 -type f -name orca 2>/dev/null
-  )
-  echo "candidates:"; echo "$CANDS" | sed 's/^/  /'
-  FIRST=$(echo "$CANDS" | grep -m1 .)
-  [ -n "$FIRST" ] && export PATH="$(dirname "$FIRST"):$PATH" && echo "using: $FIRST"
+  if [ -z "$PID" ]; then echo "orca-ide is not running -- start Orca and rerun"; else
+    ROOT=$(dirname "$(readlink -f /proc/$PID/exe)")
+    echo "orca-ide pid=$PID root=$ROOT"
+    echo "AppImage: $(tr '\0' '\n' </proc/$PID/environ 2>/dev/null | grep -E '^APPIMAGE=' || echo '(APPIMAGE env not set)')"
+    CLI="$ROOT/resources/app.asar.unpacked/out/cli/index.js"
+    if [ -f "$CLI" ]; then
+      mkdir -p "$HOME/.local/bin"
+      cat > "$HOME/.local/bin/orca" <<'LAUNCHER'
+#!/usr/bin/env bash
+# orca CLI launcher for the Linux AppImage build: resolves the live mount from the running app.
+set -euo pipefail
+PID=$(pgrep -o -x orca-ide 2>/dev/null || pgrep -o -f orca-ide 2>/dev/null) || { echo "orca: Orca app is not running" >&2; exit 1; }
+ROOT=$(dirname "$(readlink -f /proc/$PID/exe)")
+export ORCA_NODE_OPTIONS="${NODE_OPTIONS-}"; unset NODE_OPTIONS NODE_REPL_EXTERNAL_MODULE
+ELECTRON_RUN_AS_NODE=1 exec "$ROOT/orca-ide" "$ROOT/resources/app.asar.unpacked/out/cli/index.js" "$@"
+LAUNCHER
+      chmod +x "$HOME/.local/bin/orca"
+      echo "wrote launcher: $HOME/.local/bin/orca"
+    else
+      echo "cli entry not found at $CLI -- listing resources:"; ls "$ROOT/resources" 2>/dev/null | head -20
+      find "$ROOT" -maxdepth 6 -path '*cli*' -name 'index.js' 2>/dev/null | head
+    fi
+  fi
+  export PATH="$HOME/.local/bin:$PATH"
 fi
 command -v orca && orca --version || echo "orca CLI still not found"
 
