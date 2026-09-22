@@ -75,24 +75,39 @@ log "2/6  Node.js 22 (system-wide)"
 # System-wide on purpose. Orca launches agents over NON-INTERACTIVE ssh, which
 # does not source ~/.bashrc -- so nvm/fnm-managed node is invisible there and
 # the agent binary "disappears" the moment Orca tries to spawn it.
-NODE_MAJOR="$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/' || echo 0)"
+# Probe the SYSTEM node, not whatever nvm/fnm has shimmed into this shell.
+# A user-level node 24 satisfies `node -v` here and still leaves `sudo npm`
+# with "command not found" -- and leaves Orca's non-interactive SSH with no
+# node at all.
+sys_node() { env -i PATH=/usr/local/bin:/usr/bin:/bin sh -c 'command -v node' 2>/dev/null; }
+SYS_NODE="$(sys_node || true)"
+NODE_MAJOR=0
+[[ -n "$SYS_NODE" ]] && NODE_MAJOR="$("$SYS_NODE" -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/')"
+
 if [[ "${NODE_MAJOR:-0}" -lt 20 ]]; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
   sudo apt-get install -y -qq nodejs
+  if [[ -n "$(command -v node)" && "$(command -v node)" != "$(sys_node)" ]]; then
+    echo "   note: your shell still resolves node via $(command -v node) (nvm/fnm)."
+    echo "         That is fine -- Orca and sudo will use $(sys_node)."
+  fi
 else
-  echo "   node $(node -v) already present, keeping it"
+  echo "   system node $("$SYS_NODE" -v) already present, keeping it"
 fi
 
 # npm's global prefix is root-owned; keep using sudo rather than chown-ing it,
 # so a later `apt upgrade nodejs` does not fight with hand-edited permissions.
-if ! command -v claude >/dev/null 2>&1; then
+# Same trap as node: a claude installed under nvm satisfies `command -v claude`
+# in this shell and is invisible to Orca's non-interactive SSH.
+sys_claude() { env -i PATH=/usr/local/bin:/usr/bin:/bin sh -c 'command -v claude' 2>/dev/null; }
+
+if [[ -z "$(sys_claude || true)" ]]; then
   sudo npm install -g @anthropic-ai/claude-code
-else
-  echo "   claude $(claude --version 2>/dev/null) already present"
 fi
 
-# Prove it resolves the way Orca will see it: default PATH, no ~/.bashrc.
-if ! env -i PATH=/usr/local/bin:/usr/bin:/bin sh -c 'command -v claude' >/dev/null 2>&1; then
+if [[ -n "$(sys_claude || true)" ]]; then
+  echo "   claude $("$(sys_claude)" --version 2>/dev/null) at $(sys_claude)"
+else
   echo "   !! 'claude' is not on the default non-interactive PATH."
   echo "      Orca will fail to launch the agent. Check where it installed:"
   echo "        npm root -g"
