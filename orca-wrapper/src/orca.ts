@@ -46,8 +46,24 @@ async function run(args: string[], tolerateCode?: string): Promise<any> {
   return parsed.result;
 }
 
+// Absolute path of the base checkout behind config.repoId (e.g. /home/dev/repo on the droplet).
+// Looked up once: it is where `git fetch` must run before a worktree can be based on a branch.
+let cachedRepoPath: string | undefined;
+export async function repoPath(): Promise<string> {
+  if (cachedRepoPath) return cachedRepoPath;
+  const result = await run(["repo", "list"]);
+  const repos: Array<{ id: string; path?: string; rootPath?: string }> = result.repos ?? result.repositories ?? result;
+  const repo = repos.find((r) => r.id === config.repoId);
+  const path = repo?.path ?? repo?.rootPath;
+  if (!path) throw new OrcaError("repo_not_found", `repo ${config.repoId} not in orca repo list`);
+  cachedRepoPath = path;
+  return path;
+}
+
 // Always creates a NEW branch named `name` at baseBranch's current commit — it does not check
-// out baseBranch itself (see the checkout dance in worker.ts's ensureSession).
+// out baseBranch itself (see the checkout dance in worker.ts's ensureWorktree). baseBranch is
+// resolved by git in the base checkout, so it must already exist there as a local or
+// remote-tracking ref ("origin/x" after a fetch is the safe form).
 export async function worktreeCreate(name: string, baseBranch: string): Promise<string> {
   const result = await run([
     "worktree",

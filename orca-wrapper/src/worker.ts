@@ -99,12 +99,17 @@ export function createWorker(handle: DatabaseSync) {
   // Fresh worktree, then get it onto the real PR branch. The automation is created separately,
   // once the first prompt (with any attachments staged) is known.
   async function ensureWorktree(pr: number, headRef: string): Promise<string> {
-    const worktreeId = await orca.worktreeCreate(`pr-${pr}`, headRef);
+    // `worktree create --base-branch X` hands X straight to git in the BASE checkout, which only
+    // knows branches it has fetched — a PR branch pushed after the clone's last fetch fails with
+    // "invalid reference" (seen live on PR 482). So fetch it there first, then base the throwaway
+    // worktree branch on origin/<head>, which is guaranteed to exist afterwards.
+    await runInWorktree(`${config.repoId}::${await orca.repoPath()}`, "fetch", `git fetch origin ${headRef}; exit`, pr);
+    const worktreeId = await orca.worktreeCreate(`pr-${pr}`, `origin/${headRef}`);
     db.updateSession(handle, pr, { worktree_id: worktreeId });
 
-    // worktreeCreate always creates a NEW branch at headRef's current commit — it never checks
-    // out headRef itself. `terminal wait --for exit` doesn't report the shell exiting, so we
-    // poll `worktree list` until Orca's own branch field flips to confirm the checkout landed.
+    // worktreeCreate always creates a NEW branch at the base commit — it never checks out headRef
+    // itself. `git checkout <head>` here creates the local tracking branch from origin/<head>.
+    // We poll `worktree list` until Orca's own branch field flips to confirm the checkout landed.
     const checkoutCmd = `git fetch origin ${headRef} && git checkout ${headRef} && git branch --set-upstream-to=origin/${headRef}; exit`;
     const checkoutHandle = await orca.terminalCreate(worktreeId, "checkout", checkoutCmd);
     try {
@@ -113,6 +118,20 @@ export function createWorker(handle: DatabaseSync) {
       await orca.terminalClose(checkoutHandle).catch((err) => console.log(`checkout terminalClose failed pr=${pr}: ${err}`));
     }
     return worktreeId;
+  }
+
+  // One-shot shell command in a worktree, waited on until its shell exits (the command must end
+  // with `; exit`). Used for git plumbing and downloads that must finish before the agent runs.
+  async function runInWorktree(worktreeId: string, title: string, command: string, pr: number): Promise<void> {
+    const h = await orca.terminalCreate(worktreeId, title, command);
+    try {
+      const deadline = Date.now() + DOWNLOAD_MAX_MS;
+      while (Date.now() < deadline && !(await orca.terminalWaitExit(h, DOWNLOAD_WAIT_MS))) {
+        // keep waiting
+      }
+    } finally {
+      await orca.terminalClose(h).catch((err) => console.log(`${title} terminalClose failed pr=${pr}: ${err}`));
+    }
   }
 
   // Images in the comment: resolve each GitHub attachment URL to its short-lived signed URL
@@ -137,15 +156,7 @@ export function createWorker(handle: DatabaseSync) {
     if (files.length === 0) return job.prompt;
 
     // Signed URLs expire in minutes, so download right away — not from inside the agent's turn.
-    const dlHandle = await orca.terminalCreate(worktreeId, "attachments", downloadCommand(dir, files));
-    try {
-      const deadline = Date.now() + DOWNLOAD_MAX_MS;
-      while (Date.now() < deadline && !(await orca.terminalWaitExit(dlHandle, DOWNLOAD_WAIT_MS))) {
-        // keep waiting
-      }
-    } finally {
-      await orca.terminalClose(dlHandle).catch(() => {});
-    }
+    await runInWorktree(worktreeId, "attachments", downloadCommand(dir, files), job.pr);
     return rewritePrompt(job.prompt, attachments);
   }
 

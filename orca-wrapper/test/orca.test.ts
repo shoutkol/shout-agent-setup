@@ -24,3 +24,7 @@ test("other ok:false answers with exit 1 surface as OrcaError with the CLI's cod
 test("ok:true answers still parse normally", async () => {
   assert.deepStrictEqual(await orca.terminalList("w"), []);
 });
+
+test("repoPath resolves the base checkout for ORCA_REPO_ID from repo list", async () => {
+  assert.strictEqual(await orca.repoPath(), "/srv/base");
+});

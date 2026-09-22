@@ -4,5 +4,6 @@
 case "$*" in
   *"terminal wait"*) echo '{"ok":false,"error":{"code":"timeout","message":"timeout"}}'; exit 1 ;;
   *"terminal close"*) echo '{"ok":false,"error":{"code":"not_found","message":"no such terminal"}}'; exit 1 ;;
+  *"repo list"*) echo '{"ok":true,"result":{"repos":[{"id":"r","path":"/srv/base"}]}}' ;;
   *) echo '{"ok":true,"result":{"terminals":[]}}' ;;
 esac
