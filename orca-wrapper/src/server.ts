@@ -129,7 +129,9 @@ export function startServer() {
     if (method === "POST" && url.pathname === "/tasks") {
       const body = await readJson(req);
       const notionUrl = body?.notion_url;
-      const wo = body?.wo;
+      // n8n's Edit Fields node emits strings unless a type is chosen, so "73" and "[\"shout-web\"]"
+      // are what a first-draft workflow sends. Coerce the two structured fields rather than 400.
+      const wo = typeof body?.wo === "string" && /^\d+$/.test(body.wo) ? Number(body.wo) : body?.wo;
       const title = body?.title;
       if (
         typeof notionUrl !== "string" ||
@@ -144,7 +146,15 @@ export function startServer() {
         return 400;
       }
       const author = typeof body?.author === "string" && body.author ? body.author : "notion";
-      const repoApp: string[] = Array.isArray(body?.repo_app) ? body.repo_app.filter((x: unknown) => typeof x === "string") : [];
+      let rawRepoApp: unknown = body?.repo_app;
+      if (typeof rawRepoApp === "string") {
+        try {
+          rawRepoApp = JSON.parse(rawRepoApp);
+        } catch {
+          rawRepoApp = [rawRepoApp];
+        }
+      }
+      const repoApp: string[] = Array.isArray(rawRepoApp) ? rawRepoApp.filter((x: unknown) => typeof x === "string") : [];
       const prompt = typeof body?.prompt === "string" ? body.prompt : undefined;
 
       const branch = branchFor(wo, title);

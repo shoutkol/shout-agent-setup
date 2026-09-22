@@ -87,3 +87,23 @@ test("POST /tasks: valid body -> 202 with the wo-<n> session key, even though th
     close();
   }
 });
+
+test("POST /tasks: n8n-style stringy fields (wo \"73\", repo_app as a JSON string) are coerced -> 202", async () => {
+  const { server, close } = startServer();
+  await new Promise<void>((resolve) => server.on("listening", () => resolve()));
+  const address = server.address() as { port: number };
+  const base = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const res = await fetch(`${base}/tasks`, {
+      method: "POST",
+      headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ notion_url: "https://app.notion.com/p/abc", wo: "73", title: "TEST", repo_app: '["shout-web"]' }),
+    });
+    assert.strictEqual(res.status, 202);
+    const json = (await res.json()) as { key: string };
+    assert.strictEqual(json.key, "wo-73");
+  } finally {
+    close();
+  }
+});
