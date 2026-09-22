@@ -189,9 +189,8 @@ export function createWorker(handle: DatabaseSync) {
 
   async function postResult(job: db.Job, content: string, truncated: boolean): Promise<void> {
     const truncatedNote = truncated ? "\n\n⚠️ output truncated by Orca" : "";
-    const body =
-      `🐳 orca: done for @${job.author}'s request\n` +
-      `<details><summary>agent output</summary>\n\n${content}\n\n</details>${truncatedNote}`;
+    // Output goes inline, not folded: readers wanted the answer visible without a click.
+    const body = `🐳 orca: done for @${job.author}'s request\n\n${content}${truncatedNote}`;
     await github.comment(job.pr, body);
   }
 
