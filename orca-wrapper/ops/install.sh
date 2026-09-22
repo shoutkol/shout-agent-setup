@@ -222,9 +222,13 @@ echo "   orca-wrapper enabled and started"
 # -----------------------------------------------------------------------------
 log "9/9  Smoke test"
 # -----------------------------------------------------------------------------
-PORT="$(grep -E '^PORT=' "$ENV_FILE" | cut -d= -f2)"
+# PORT is commented out in env.example, so this grep normally matches nothing -- and a no-match
+# grep exits 1, which under pipefail + the ERR trap would abort the whole install right here.
+PORT="$(grep -E '^PORT=' "$ENV_FILE" | cut -d= -f2 || true)"
 PORT="${PORT:-8787}"
-[[ -z "$TOKEN" ]] && TOKEN="$(grep -E '^ORCA_WRAPPER_TOKEN=' "$ENV_FILE" | cut -d= -f2)"
+if [[ -z "$TOKEN" ]]; then
+  TOKEN="$(grep -E '^ORCA_WRAPPER_TOKEN=' "$ENV_FILE" | cut -d= -f2 || true)"
+fi
 
 SMOKE=""
 for _ in 1 2 3 4 5; do
