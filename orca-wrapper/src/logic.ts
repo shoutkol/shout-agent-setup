@@ -57,3 +57,24 @@ export function isLaunchFrame(content: string, preambleMarker: string): boolean 
   if (preambleMarker && c.includes(preambleMarker)) return true;
   return /\$\s*$/.test(c);
 }
+
+// Git branch for a Notion work order: claude/WO-<wo>-<slug>, ASCII letters/digits only, spaces
+// collapsed to single dashes, capped at 40 chars of slug. A title with nothing sluggable (e.g.
+// all-Thai) yields just claude/WO-<wo> — the WO number alone is still a unique, valid branch name.
+export function branchFor(wo: number, title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .slice(0, 40)
+    .replace(/-+$/, ""); // a 40-char cut can land mid-dash; drop the dangling one
+  return slug ? `claude/WO-${wo}-${slug}` : `claude/WO-${wo}`;
+}
+
+// Loose check for the /tasks payload: n8n forwards whatever URL the Notion page gave it verbatim
+// (notion.so or a custom domain), so we only need https + "notion" somewhere in the host, not a
+// strict shape.
+export function isNotionUrl(url: string): boolean {
+  return /^https:\/\/\S*notion\S*/i.test(url);
+}

@@ -1,11 +1,11 @@
-// HTTP API. Plain node:http, no framework — five routes, all JSON, all bearer-authed.
+// HTTP API. Plain node:http, no framework — all routes JSON, all bearer-authed.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { URL } from "node:url";
 import { config } from "./config.ts";
-import { openDb, getSession, getQueue, getLastOutput, listOpenSessions } from "./db.ts";
+import { openDb, getSessionByPr, getSession, getQueue, getLastOutput, listOpenSessions, taskKey } from "./db.ts";
 import { createWorker } from "./worker.ts";
-import { parseCommand } from "./logic.ts";
+import { parseCommand, branchFor, isNotionUrl } from "./logic.ts";
 
 const WORKER_TICK_MS = 10_000;
 const IDLE_SWEEP_MS = 60 * 60 * 1000;
@@ -58,6 +58,7 @@ export function startServer() {
     const url = new URL(req.url ?? "/", "http://internal");
     const method = req.method ?? "GET";
     const prMatch = /^\/pr\/(\d+)(\/prompt)?$/.exec(url.pathname);
+    const taskMatch = /^\/tasks(?:\/(\d+))?$/.exec(url.pathname);
 
     if (method === "POST" && prMatch && prMatch[2] === "/prompt") {
       const pr = Number(prMatch[1]);
@@ -88,29 +89,85 @@ export function startServer() {
         return 400;
       }
       if (cmd.type === "stop") {
-        await worker.closeSession(pr);
+        // Session may not exist under key `pr-<n>` — it could be a task session whose PR this is.
+        // getSessionByPr finds either; when there's truly nothing to close, closeSession no-ops
+        // safely on the fallback key. Always 202: an /orca stop comment on a PR with no live
+        // session isn't an error from the commenter's point of view.
+        const session = getSessionByPr(db, pr);
+        await worker.closeSession(session?.key ?? `pr-${pr}`);
         send(res, 202, { closed: true });
         return 202;
       }
-      const { jobId, position } = worker.enqueue(pr, headRef, commentId, author, cmd.prompt);
+      const { jobId, position } = worker.enqueuePrJob(pr, headRef, commentId, author, cmd.prompt);
       send(res, 202, { job_id: jobId, position });
       return 202;
     }
 
     if (method === "GET" && prMatch && !prMatch[2]) {
       const pr = Number(prMatch[1]);
-      const session = getSession(db, pr);
+      const session = getSessionByPr(db, pr);
       if (!session) {
         send(res, 404, { error: "not found" });
         return 404;
       }
-      send(res, 200, { session, queue: getQueue(db, pr), last_output: getLastOutput(db, pr) });
+      send(res, 200, { session, queue: getQueue(db, session.key), last_output: getLastOutput(db, session.key) });
       return 200;
     }
 
     if (method === "DELETE" && prMatch && !prMatch[2]) {
       const pr = Number(prMatch[1]);
-      const closed = await worker.closeSession(pr);
+      const session = getSessionByPr(db, pr);
+      const closed = session ? await worker.closeSession(session.key) : false;
+      if (!closed) {
+        send(res, 404, { error: "not found" });
+        return 404;
+      }
+      send(res, 202, { closed: true });
+      return 202;
+    }
+
+    if (method === "POST" && url.pathname === "/tasks") {
+      const body = await readJson(req);
+      const notionUrl = body?.notion_url;
+      const wo = body?.wo;
+      const title = body?.title;
+      if (
+        typeof notionUrl !== "string" ||
+        !isNotionUrl(notionUrl) ||
+        typeof wo !== "number" ||
+        !Number.isInteger(wo) ||
+        wo <= 0 ||
+        typeof title !== "string" ||
+        !title.trim()
+      ) {
+        send(res, 400, { error: "missing or invalid field" });
+        return 400;
+      }
+      const author = typeof body?.author === "string" && body.author ? body.author : "notion";
+      const repoApp: string[] = Array.isArray(body?.repo_app) ? body.repo_app.filter((x: unknown) => typeof x === "string") : [];
+      const prompt = typeof body?.prompt === "string" ? body.prompt : undefined;
+
+      const branch = branchFor(wo, title);
+      const repoAppLine = repoApp.length > 0 ? repoApp.join(", ") : null;
+      const { key, jobId, position } = worker.enqueueTask(wo, notionUrl, title, author, branch, repoAppLine, prompt);
+      send(res, 202, { key, job_id: jobId, position });
+      return 202;
+    }
+
+    if (method === "GET" && taskMatch && taskMatch[1]) {
+      const key = taskKey(Number(taskMatch[1]));
+      const session = getSession(db, key);
+      if (!session) {
+        send(res, 404, { error: "not found" });
+        return 404;
+      }
+      send(res, 200, { session, queue: getQueue(db, key), last_output: getLastOutput(db, key) });
+      return 200;
+    }
+
+    if (method === "DELETE" && taskMatch && taskMatch[1]) {
+      const key = taskKey(Number(taskMatch[1]));
+      const closed = await worker.closeSession(key);
       if (!closed) {
         send(res, 404, { error: "not found" });
         return 404;

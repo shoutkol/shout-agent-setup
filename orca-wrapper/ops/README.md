@@ -104,6 +104,11 @@ cd ~/shout-agent-setup && git pull
 systemctl --user restart orca-wrapper
 ```
 
+If this update adds the `/tasks` (Notion work order) routes, the `sessions`/`jobs` schema changed
+from PR-keyed to key-keyed and `openDb` does not migrate old rows: stop the service, `rm
+~/.local/share/orca-wrapper/state.sqlite*`, then start it again (see orca-wrapper's own
+`README.md`).
+
 `ops/Caddyfile` and `ops/orca-wrapper.service` are files on disk, not
 symlinks -- a plain `git pull` does not re-apply them. Re-run
 `bash ops/install.sh` after `git pull` if either changed (it is idempotent
