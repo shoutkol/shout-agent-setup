@@ -51,6 +51,12 @@ KEY_PATH="$HOME/.ssh/$KEY_NAME"
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
 export DEBIAN_FRONTEND=noninteractive
+# Ubuntu 22.04+ ships needrestart in interactive mode: it stops mid-install to
+# ask which daemons to bounce, which hangs an otherwise unattended run. 'a' =
+# restart automatically, and the suspend flag keeps it from touching ssh.service
+# out from under the connection running this script.
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
 
 # -----------------------------------------------------------------------------
 log "1/6  Host requirements (git + build toolchain)"
