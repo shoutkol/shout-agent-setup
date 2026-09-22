@@ -22,10 +22,22 @@ export class OrcaError extends Error {
 // tolerateCode: if the command reports ok:false with this error code, return null instead of
 // throwing — used only by terminalWaitIdle, where a timeout is an expected "still running" poll.
 async function run(args: string[], tolerateCode?: string): Promise<any> {
-  const { stdout } = await execFileAsync(config.orcaBin, [...args, "--json"], {
-    timeout: EXEC_TIMEOUT_MS,
-    maxBuffer: MAX_BUFFER,
-  });
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(config.orcaBin, [...args, "--json"], {
+      timeout: EXEC_TIMEOUT_MS,
+      maxBuffer: MAX_BUFFER,
+    }));
+  } catch (err: any) {
+    // The CLI exits 1 on an ok:false answer (e.g. `terminal wait` timing out) while still
+    // printing the JSON envelope on stdout, so execFile rejects. Fall through to the envelope
+    // when there is one; only a missing/unparseable envelope is a real exec failure.
+    if (typeof err?.stdout !== "string" || !err.stdout.trim().startsWith("{")) {
+      const detail = String(err?.stderr ?? err?.message ?? err).trim().slice(0, 300);
+      throw new OrcaError("exec", `orca ${args.slice(0, 2).join(" ")} failed: ${detail}`);
+    }
+    stdout = err.stdout;
+  }
   const parsed = JSON.parse(String(stdout));
   if (!parsed.ok) {
     if (tolerateCode && parsed.error?.code === tolerateCode) return null;
