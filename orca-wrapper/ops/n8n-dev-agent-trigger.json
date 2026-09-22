@@ -1,0 +1,176 @@
+{
+  "name": "Dev Agent Trigger",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "29da1523-1b76-428e-a547-97cccf73ea98",
+        "authentication": "headerAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -400,
+        -16
+      ],
+      "id": "2822ce9c-01f2-48ad-80d7-10978a0918a4",
+      "name": "Webhook",
+      "webhookId": "29da1523-1b76-428e-a547-97cccf73ea98",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5306rQneJwPD8HLb",
+          "name": "Notion Dev Trigger"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1645c965-5a5c-411b-9acc-6db680311f34",
+              "name": "notion_url",
+              "value": "={{ $json.body.data.url }}",
+              "type": "string"
+            },
+            {
+              "id": "75733fca-0144-4848-83f4-8491ecc931c2",
+              "name": "wo",
+              "value": "={{ $json.body.data.properties.WO.unique_id.number }}",
+              "type": "number"
+            },
+            {
+              "id": "63ee013b-c90b-48d3-a25e-088695fe2518",
+              "name": "title",
+              "value": "={{ $json.body.data.properties.Name.title.map(t => t.plain_text).join('') }}",
+              "type": "string"
+            },
+            {
+              "id": "105d14e9-b9aa-4644-91e7-9fde21de4423",
+              "name": "author",
+              "value": "={{ $json.body.data.properties['Requested by'].people[0]?.name ?? 'notion' }}",
+              "type": "string"
+            },
+            {
+              "id": "7a17bbd5-13dc-4800-819d-3763b16955ae",
+              "name": "repo_app",
+              "value": "={{ $json.body.data.properties['Repo / App'].multi_select.map(o => o.name) }}",
+              "type": "array"
+            },
+            {
+              "id": "82b2ed8f-3ff2-462d-87fa-8679a9fed66d",
+              "name": "prompt",
+              "value": "You are working in a git worktree checked out on branch `{{branch}}` of shoutkol/shout, created from `dev` for Work Order WO-{{wo}} \"{{title}}\": {{notion_url}}. First read that Notion page with your Notion tools (claude.ai Notion connector) — it is the spec. Implement it. Commit as you go and ALWAYS `git push origin {{branch}}` before you finish, even if the work is incomplete or you are blocked — the pull request is where open questions get discussed. Do not create other branches or PRs (the wrapper opens the PR) and do not update the Notion page yet. End with a concise summary of what changed and what is left; put each open question on its own line starting `QUESTION:`. The work touches: {{repo_app}}.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -192,
+        -16
+      ],
+      "id": "e08a9196-c363-4824-bada-198246dd02f7",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://orca.shouttgt.com/tasks",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        32,
+        -16
+      ],
+      "id": "80317959-d46e-4b2b-bebc-a2c20fe7e354",
+      "name": "HTTP Request1",
+      "credentials": {
+        "httpBearerAuth": {
+          "id": "VgLsQVJQUv6vTSbw",
+          "name": "ORCA_WRAPPER_TOKEN"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $('Webhook').item.json.body.data.id }}",
+          "mode": "id"
+        },
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Stage|select",
+              "selectValue": "Building"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        256,
+        -16
+      ],
+      "id": "d220a285-1ba7-49ed-8ef6-b385284ff1d0",
+      "name": "Update a database page",
+      "credentials": {
+        "notionApi": {
+          "id": "V8KGNwzAPsZfnYiJ",
+          "name": "Notion account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request1": {
+      "main": [
+        [
+          {
+            "node": "Update a database page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

@@ -133,6 +133,10 @@ export function startServer() {
       // are what a first-draft workflow sends. Coerce the two structured fields rather than 400.
       const wo = typeof body?.wo === "string" && /^\d+$/.test(body.wo) ? Number(body.wo) : body?.wo;
       const title = body?.title;
+      // `prompt` is the task's actual first-run instructions to the agent — authored in Notion,
+      // passed through verbatim by n8n (see worker.buildPrompt / logic.renderPrompt). Required and
+      // non-empty: there is no more hard-coded fallback text to run without it.
+      const prompt = body?.prompt;
       if (
         typeof notionUrl !== "string" ||
         !isNotionUrl(notionUrl) ||
@@ -140,7 +144,9 @@ export function startServer() {
         !Number.isInteger(wo) ||
         wo <= 0 ||
         typeof title !== "string" ||
-        !title.trim()
+        !title.trim() ||
+        typeof prompt !== "string" ||
+        !prompt.trim()
       ) {
         send(res, 400, { error: "missing or invalid field" });
         return 400;
@@ -155,7 +161,6 @@ export function startServer() {
         }
       }
       const repoApp: string[] = Array.isArray(rawRepoApp) ? rawRepoApp.filter((x: unknown) => typeof x === "string") : [];
-      const prompt = typeof body?.prompt === "string" ? body.prompt : undefined;
 
       const branch = branchFor(wo, title);
       const repoAppLine = repoApp.length > 0 ? repoApp.join(", ") : null;

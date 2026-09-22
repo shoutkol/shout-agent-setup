@@ -14,23 +14,3 @@ export function preamble(headRef: string, pr: number): string {
     `summary; if you are blocked or need a decision, end with a line starting \`QUESTION:\`.`
   );
 }
-
-// Sent on every run of a task session (not just the first) for the same reason preamble() above
-// re-sends its ground rules every time: the automation's prompt is fully replaced on each
-// `automations edit`, so anything the agent must be reminded of has to be in the text we send.
-// The one exception is the auto-generated "write the PR back to Notion" follow-up job, which uses
-// its own prompt verbatim (see worker.ts) — repeating "do not update the Notion page yet" right
-// before asking it to do exactly that would be self-contradicting.
-export function taskPreamble(branch: string, wo: number, title: string, notionUrl: string, repoApp: string | null): string {
-  const repoLine = repoApp ? ` The work touches: ${repoApp}.` : "";
-  return (
-    `${PREAMBLE_MARKER} \`${branch}\` of shoutkol/shout, created from \`dev\` for Work Order ` +
-    `WO-${wo} "${title}": ${notionUrl}. First read that Notion page with your Notion tools ` +
-    `(claude.ai Notion connector) — it is the spec. Implement it. Commit as you go and ALWAYS ` +
-    `\`git push origin ${branch}\` before you finish, even if the work is incomplete or you are ` +
-    `blocked — the pull request is where open questions get discussed. Do not create other ` +
-    `branches or PRs (the wrapper opens the PR) and do not update the Notion page yet. End with a ` +
-    `concise summary of what changed and what is left; put each open question on its own line ` +
-    `starting \`QUESTION:\`.${repoLine}`
-  );
-}

@@ -29,6 +29,7 @@ export interface Session {
   wo: number | null; // kind 'task' only
   title: string | null; // kind 'task' only
   repo_app: string | null; // kind 'task' only — "Repo / App" multi-select, joined for the preamble
+  prompt_template: string | null; // kind 'task' only — the first run's `prompt` (n8n/Notion-authored), kept for reference; see logic.renderPrompt
 }
 
 export interface Job {
@@ -72,7 +73,8 @@ export function openDb(path: string): DatabaseSync {
       notion_url TEXT,
       wo INTEGER,
       title TEXT,
-      repo_app TEXT
+      repo_app TEXT,
+      prompt_template TEXT
     );
   `);
   // Looked up on every /pr route and by ensurePrSession — a task session's pr column is set once
@@ -166,14 +168,15 @@ export function ensureTaskSession(
   title: string,
   branch: string,
   repoApp: string | null,
+  promptTemplate: string,
 ): Session {
   const key = taskKey(wo);
   const existing = getSession(db, key);
   if (existing && existing.state !== "closed") return existing;
   const now = Date.now();
   db.prepare(
-    `INSERT INTO sessions (key, kind, pr, head_ref, worktree_id, automation_id, terminal_handle, state, created_at, last_activity, notion_url, wo, title, repo_app)
-     VALUES (?, 'task', NULL, ?, NULL, NULL, NULL, 'creating', ?, ?, ?, ?, ?, ?)
+    `INSERT INTO sessions (key, kind, pr, head_ref, worktree_id, automation_id, terminal_handle, state, created_at, last_activity, notion_url, wo, title, repo_app, prompt_template)
+     VALUES (?, 'task', NULL, ?, NULL, NULL, NULL, 'creating', ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET
        pr = NULL,
        head_ref = excluded.head_ref,
@@ -184,8 +187,9 @@ export function ensureTaskSession(
        last_activity = excluded.last_activity,
        notion_url = excluded.notion_url,
        title = excluded.title,
-       repo_app = excluded.repo_app`,
-  ).run(key, branch, now, now, notionUrl, wo, title, repoApp);
+       repo_app = excluded.repo_app,
+       prompt_template = excluded.prompt_template`,
+  ).run(key, branch, now, now, notionUrl, wo, title, repoApp, promptTemplate);
   return getSession(db, key)!;
 }
 

@@ -98,7 +98,7 @@ otherwise). All JSON.
 | `POST` | `/pr/{n}/prompt` | `{ head_ref, base_ref, comment_id, body, author }` | 202 `{ job_id, position }`, or 202 `{ closed: true }` if `body` is `/orca stop` |
 | `GET` | `/pr/{n}` | — | 200 `{ session, queue, last_output }`, or 404 |
 | `DELETE` | `/pr/{n}` | — | 202 `{ closed: true }`, or 404 |
-| `POST` | `/tasks` | `{ notion_url, wo, title, author?, repo_app?, prompt? }` | 202 `{ key, job_id, position }` |
+| `POST` | `/tasks` | `{ notion_url, wo, title, prompt, author?, repo_app? }` | 202 `{ key, job_id, position }` |
 | `GET` | `/tasks/{wo}` | — | 200 `{ session, queue, last_output }`, or 404 |
 | `DELETE` | `/tasks/{wo}` | — | 202 `{ closed: true }`, or 404 |
 | `GET` | `/sessions` | — | 200, list of open sessions |
@@ -129,16 +129,32 @@ through its Notion connector):
 `slug` is the title lower-cased, non-ASCII-alnum characters stripped, whitespace collapsed to
 single dashes, capped at 40 chars (see `branchFor` in `src/logic.ts`); a title with nothing
 sluggable (e.g. all-Thai) yields just `claude/WO-<wo>`. `POST /tasks` on a WO that already has a
-live session enqueues a follow-up job instead of starting a new one — `prompt` if given, else
-"The Notion work order was updated — re-read it and continue."
+live session enqueues that request's own `prompt` as a follow-up job instead of starting a new one
+(the session's original `prompt` is not reused or appended).
 
-**Two-run flow**, driven from `worker.ts`:
+**`prompt`** is the task's actual first-run instructions to the agent — required, non-empty,
+authored in Notion and passed through by n8n exactly as written (there's no more hard-coded
+fallback text). Before each run — the first one, or a later follow-up's own `prompt` — it's
+rendered through `renderPrompt` in `src/logic.ts`, which substitutes:
+
+| Placeholder | Value |
+|---|---|
+| `{{branch}}` | the session's branch, `claude/WO-<wo>-<slug>` |
+| `{{wo}}` | the work order number |
+| `{{title}}` | the Notion page title |
+| `{{notion_url}}` | the Notion page URL |
+| `{{repo_app}}` | `repo_app`, comma-joined, or empty |
+
+An unrecognised `{{...}}` is left untouched rather than blanked. The first run's `prompt` is also
+kept on the session as `prompt_template` (`src/db.ts`) for reference; the auto-generated
+Notion-writeback job (below) keeps its own hard-coded prompt and is never rendered.
+
+**Two-run flow**, driven from `worker.ts` — unchanged except for where the first prompt comes from:
 
 1. The wrapper creates a fresh worktree, force-creates the branch off `origin/dev`, and pushes it
    immediately (before the agent runs at all) so the branch always exists on origin. The agent is
-   told, via `taskPreamble` in `src/preamble.ts`, to read the Notion page as its spec, implement
-   it, and always `git push` before finishing — even if blocked, so the PR is where open questions
-   get discussed.
+   told, via the rendered `prompt`, to read the Notion page as its spec, implement it, and always
+   `git push` before finishing — even if blocked, so the PR is where open questions get discussed.
 2. Once that run completes, the wrapper checks `GET /repos/{repo}/compare/dev...<branch>`. If
    `ahead_by === 0` (the agent pushed nothing), no PR is opened — the job is just marked done, and
    a later `POST /tasks` can pick the session back up. Otherwise the wrapper opens the PR itself

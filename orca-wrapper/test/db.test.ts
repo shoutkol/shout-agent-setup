@@ -65,7 +65,15 @@ test("restart marks a running job as failed, never resent", () => {
 
 test("task session is keyed wo-<n>, kind 'task', pr starts null", () => {
   const db = openDb(":memory:");
-  const session = ensureTaskSession(db, 12, "https://notion.so/wo-12", "Campaign owner credit", "claude/WO-12-campaign-owner-credit", null);
+  const session = ensureTaskSession(
+    db,
+    12,
+    "https://notion.so/wo-12",
+    "Campaign owner credit",
+    "claude/WO-12-campaign-owner-credit",
+    null,
+    "Implement {{title}} on {{branch}}.",
+  );
   assert.strictEqual(session.key, "wo-12");
   assert.strictEqual(session.kind, "task");
   assert.strictEqual(session.pr, null);
@@ -73,6 +81,7 @@ test("task session is keyed wo-<n>, kind 'task', pr starts null", () => {
   assert.strictEqual(session.notion_url, "https://notion.so/wo-12");
   assert.strictEqual(session.title, "Campaign owner credit");
   assert.strictEqual(session.wo, 12);
+  assert.strictEqual(session.prompt_template, "Implement {{title}} on {{branch}}.");
   assert.strictEqual(getSession(db, taskKey(12))?.key, "wo-12");
 
   db.close();
@@ -80,7 +89,7 @@ test("task session is keyed wo-<n>, kind 'task', pr starts null", () => {
 
 test("getSessionByPr finds a task session once its pr column is set", () => {
   const db = openDb(":memory:");
-  ensureTaskSession(db, 12, "https://notion.so/wo-12", "Campaign owner credit", "claude/WO-12-campaign-owner-credit", null);
+  ensureTaskSession(db, 12, "https://notion.so/wo-12", "Campaign owner credit", "claude/WO-12-campaign-owner-credit", null, "go");
   assert.strictEqual(getSessionByPr(db, 427), undefined);
 
   updateSession(db, taskKey(12), { pr: 427 });
@@ -94,7 +103,7 @@ test("getSessionByPr finds a task session once its pr column is set", () => {
 
 test("jobs are keyed by session_key: one running job per session, independent of kind", () => {
   const db = openDb(":memory:");
-  ensureTaskSession(db, 5, "https://notion.so/wo-5", "Fix thing", "claude/WO-5-fix-thing", null);
+  ensureTaskSession(db, 5, "https://notion.so/wo-5", "Fix thing", "claude/WO-5-fix-thing", null, "go");
   enqueueJob(db, taskKey(5), null, "notion", "");
   enqueueJob(db, taskKey(5), null, "notion", "follow up");
 
@@ -110,7 +119,7 @@ test("jobs are keyed by session_key: one running job per session, independent of
 
 test("ensurePrSession reuses the existing session for a PR that already has one (e.g. from a task)", () => {
   const db = openDb(":memory:");
-  ensureTaskSession(db, 12, "https://notion.so/wo-12", "Campaign owner credit", "claude/WO-12-campaign-owner-credit", null);
+  ensureTaskSession(db, 12, "https://notion.so/wo-12", "Campaign owner credit", "claude/WO-12-campaign-owner-credit", null, "go");
   updateSession(db, taskKey(12), { pr: 427 });
 
   const session = ensurePrSession(db, 427, "claude/WO-12-campaign-owner-credit");

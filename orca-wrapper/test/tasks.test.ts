@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { branchFor, isNotionUrl } from "../src/logic.ts";
+import { branchFor, isNotionUrl, renderPrompt } from "../src/logic.ts";
 
 test("branchFor: normal title -> claude/WO-<n>-<slug>", () => {
   assert.strictEqual(branchFor(12, "Campaign owner credit"), "claude/WO-12-campaign-owner-credit");
@@ -31,4 +31,33 @@ test("isNotionUrl: rejects non-https and non-Notion URLs", () => {
   assert.strictEqual(isNotionUrl("http://notion.so/abc123"), false);
   assert.strictEqual(isNotionUrl("https://example.com/abc123"), false);
   assert.strictEqual(isNotionUrl("not a url"), false);
+});
+
+test("renderPrompt: replaces every known placeholder with the session's values", () => {
+  const out = renderPrompt("Branch {{branch}} for WO-{{wo}}: {{title}}. Spec: {{notion_url}}", {
+    branch: "claude/WO-12-campaign-owner-credit",
+    wo: "12",
+    title: "Campaign owner credit",
+    notion_url: "https://notion.so/wo-12",
+    repo_app: "",
+  });
+  assert.strictEqual(
+    out,
+    "Branch claude/WO-12-campaign-owner-credit for WO-12: Campaign owner credit. Spec: https://notion.so/wo-12",
+  );
+});
+
+test("renderPrompt: repo_app is comma-joined, or blank when there is none", () => {
+  const vars = { branch: "", wo: "", title: "", notion_url: "", repo_app: "" };
+  assert.strictEqual(renderPrompt("apps: {{repo_app}}.", vars), "apps: .");
+  assert.strictEqual(renderPrompt("apps: {{repo_app}}.", { ...vars, repo_app: "shout-web, shout-ai" }), "apps: shout-web, shout-ai.");
+});
+
+test("renderPrompt: an unrecognised placeholder is left untouched, not blanked", () => {
+  const vars = { branch: "b", wo: "1", title: "t", notion_url: "n", repo_app: "" };
+  assert.strictEqual(renderPrompt("Hello {{nickname}}!", vars), "Hello {{nickname}}!");
+});
+
+test("renderPrompt: a template with no placeholders is returned unchanged", () => {
+  assert.strictEqual(renderPrompt("Just read the ticket and go.", {}), "Just read the ticket and go.");
 });

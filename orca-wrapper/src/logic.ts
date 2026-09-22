@@ -78,3 +78,12 @@ export function branchFor(wo: number, title: string): string {
 export function isNotionUrl(url: string): boolean {
   return /^https:\/\/\S*notion\S*/i.test(url);
 }
+
+// Renders a task's prompt (authored in Notion, passed through by n8n as `prompt` — see
+// server.ts's POST /tasks) against the session's own values, replacing `{{branch}}`, `{{wo}}`,
+// `{{title}}`, `{{notion_url}}`, `{{repo_app}}`. An unrecognised `{{...}}` is left untouched
+// rather than blanked, so a typo in the Notion prompt fails loudly instead of silently vanishing;
+// a template with no placeholders at all is returned unchanged.
+export function renderPrompt(template: string, vars: Record<string, string>): string {
+  return template.replace(/\{\{(\w+)\}\}/g, (match, key) => (key in vars ? vars[key] : match));
+}

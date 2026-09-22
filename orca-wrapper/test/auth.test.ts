@@ -45,9 +45,11 @@ test("POST /tasks: missing/invalid fields -> 400", async () => {
   try {
     const cases = [
       {}, // nothing at all
-      { notion_url: "https://not-a-real-host.example/x", wo: 12, title: "Campaign owner credit" }, // not a notion URL
-      { notion_url: "https://notion.so/x", wo: 0, title: "Campaign owner credit" }, // wo not positive
-      { notion_url: "https://notion.so/x", wo: 12, title: "" }, // blank title
+      { notion_url: "https://not-a-real-host.example/x", wo: 12, title: "Campaign owner credit", prompt: "go" }, // not a notion URL
+      { notion_url: "https://notion.so/x", wo: 0, title: "Campaign owner credit", prompt: "go" }, // wo not positive
+      { notion_url: "https://notion.so/x", wo: 12, title: "", prompt: "go" }, // blank title
+      { notion_url: "https://notion.so/x", wo: 12, title: "Campaign owner credit" }, // missing prompt
+      { notion_url: "https://notion.so/x", wo: 12, title: "Campaign owner credit", prompt: "   " }, // blank prompt
     ];
     for (const body of cases) {
       const res = await fetch(`${base}/tasks`, {
@@ -76,6 +78,7 @@ test("POST /tasks: valid body -> 202 with the wo-<n> session key, even though th
         notion_url: "https://www.notion.so/Campaign-owner-credit-abc123",
         wo: 12,
         title: "Campaign owner credit",
+        prompt: "Implement {{title}} on {{branch}}.",
       }),
     });
     assert.strictEqual(res.status, 202);
@@ -98,7 +101,7 @@ test("POST /tasks: n8n-style stringy fields (wo \"73\", repo_app as a JSON strin
     const res = await fetch(`${base}/tasks`, {
       method: "POST",
       headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
-      body: JSON.stringify({ notion_url: "https://app.notion.com/p/abc", wo: "73", title: "TEST", repo_app: '["shout-web"]' }),
+      body: JSON.stringify({ notion_url: "https://app.notion.com/p/abc", wo: "73", title: "TEST", repo_app: '["shout-web"]', prompt: "go" }),
     });
     assert.strictEqual(res.status, 202);
     const json = (await res.json()) as { key: string };

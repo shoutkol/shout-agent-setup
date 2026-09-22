@@ -8,8 +8,8 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { isDone, isLaunchFrame, stable } from "./logic.ts";
-import { preamble, taskPreamble, PREAMBLE_MARKER } from "./preamble.ts";
+import { isDone, isLaunchFrame, stable, renderPrompt } from "./logic.ts";
+import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
 
 const POLL_MS = 5_000;
@@ -46,8 +46,11 @@ export function createWorker(handle: DatabaseSync) {
     return { jobId: id, position };
   }
 
-  // POST /tasks. A live session for the WO gets a follow-up job (the normal queue/run/wait path);
-  // otherwise a fresh task session is created and this is its first job.
+  // POST /tasks. `prompt` is required and Notion-authored (n8n passes it through verbatim) — a
+  // live session for the WO gets it enqueued as a follow-up job (the normal queue/run/wait path,
+  // using THIS request's prompt, not the session's original one); otherwise a fresh task session
+  // is created, `prompt` is kept on it as `prompt_template` for reference, and this is its first
+  // job. Either way, buildPrompt renders the job's own `prompt` at run time (see logic.renderPrompt).
   function enqueueTask(
     wo: number,
     notionUrl: string,
@@ -55,18 +58,17 @@ export function createWorker(handle: DatabaseSync) {
     author: string,
     branch: string,
     repoAppLine: string | null,
-    prompt: string | undefined,
+    prompt: string,
   ): { key: string; jobId: number; position: number } {
     const key = db.taskKey(wo);
     const existing = db.getSession(handle, key);
     if (existing && existing.state !== "closed") {
-      const followup = prompt ?? "The Notion work order was updated — re-read it and continue.";
-      const { id, position } = db.enqueueJob(handle, key, null, author, followup);
+      const { id, position } = db.enqueueJob(handle, key, null, author, prompt);
       tick();
       return { key, jobId: id, position };
     }
-    db.ensureTaskSession(handle, wo, notionUrl, title, branch, repoAppLine);
-    const { id, position } = db.enqueueJob(handle, key, null, author, prompt ?? "");
+    db.ensureTaskSession(handle, wo, notionUrl, title, branch, repoAppLine, prompt);
+    const { id, position } = db.enqueueJob(handle, key, null, author, prompt);
     tick();
     return { key, jobId: id, position };
   }
@@ -110,7 +112,12 @@ export function createWorker(handle: DatabaseSync) {
       const runId = await orca.automationRun(session.automation_id!);
       db.setJobRunId(handle, job.id, runId);
 
-      const result = await waitForCompletion(session, runId);
+      // PR sessions always start with the same hard-coded preamble, so PREAMBLE_MARKER alone spots
+      // the terminal echoing it back. A task's prompt is Notion-authored and varies per session (and
+      // per follow-up), so its own first 40 chars are the marker instead — enough to recognise the
+      // echo without false-matching on a short real answer that happens to start the same way.
+      const marker = session.kind === "pr" ? PREAMBLE_MARKER : prompt.slice(0, 40);
+      const result = await waitForCompletion(session, runId, marker);
       if (result.outcome === "done") {
         db.markJobDone(handle, job.id, result.content);
         db.touchSession(handle, session.key);
@@ -235,17 +242,22 @@ export function createWorker(handle: DatabaseSync) {
   }
 
   // Full text handed to `automations create`/`edit`. PR jobs get the ground-rules preamble plus
-  // the comment's own text (with attachment URLs rewritten to local paths). Task jobs get the WO
-  // briefing plus any extra prompt text, except the auto-generated Notion-writeback job, which is
-  // sent exactly as stored (see NOTION_UPDATE_KIND in handleCompletion).
+  // the comment's own text (with attachment URLs rewritten to local paths). Task jobs get their
+  // own `prompt` (n8n/Notion-authored, first run or follow-up — see enqueueTask) rendered against
+  // the session's values, except the auto-generated Notion-writeback job, which is sent exactly as
+  // stored (see NOTION_UPDATE_KIND in handleCompletion).
   async function buildPrompt(session: db.Session, job: db.Job, worktreeId: string): Promise<string> {
     if (session.kind === "pr") {
       return preamble(session.head_ref!, session.pr!) + "\n\n" + (await stageAttachments(job, worktreeId, session.pr!));
     }
     if (job.kind === NOTION_UPDATE_KIND) return job.prompt;
-    const base = taskPreamble(session.head_ref!, session.wo!, session.title!, session.notion_url!, session.repo_app);
-    const extra = job.prompt.trim();
-    return extra ? `${base}\n\n${extra}` : base;
+    return renderPrompt(job.prompt, {
+      branch: session.head_ref ?? "",
+      wo: session.wo != null ? String(session.wo) : "",
+      title: session.title ?? "",
+      notion_url: session.notion_url ?? "",
+      repo_app: session.repo_app ?? "",
+    });
   }
 
   async function pollUntilCheckedOut(worktreeId: string, branch: string): Promise<void> {
@@ -260,7 +272,7 @@ export function createWorker(handle: DatabaseSync) {
     throw new Error(`worktree ${worktreeId} did not check out ${branch} within ${BRANCH_POLL_MAX_MS}ms`);
   }
 
-  async function waitForCompletion(session: db.Session, runId: string): Promise<CompletionResult> {
+  async function waitForCompletion(session: db.Session, runId: string, marker: string): Promise<CompletionResult> {
     const deadline = Date.now() + config.runTimeoutMin * 60_000;
     // Resolved from this run's terminalSessionId, not reused from the session row: when the
     // previous live session is gone Orca silently starts a new one, and the stored handle would
@@ -297,7 +309,7 @@ export function createWorker(handle: DatabaseSync) {
       const idle = terminalHandle ? await orca.terminalWaitIdle(terminalHandle, TERMINAL_IDLE_TIMEOUT_MS) : false;
       const snap = run.outputSnapshot;
       const capturedAt = snap?.capturedAt ?? null;
-      const realAnswer = snap != null && !isLaunchFrame(snap.content, PREAMBLE_MARKER);
+      const realAnswer = snap != null && !isLaunchFrame(snap.content, marker);
       if (isDone(run.status, idle) === "done" && realAnswer && stable([prevCapturedAt, capturedAt])) {
         return { outcome: "done", content: snap!.content, truncated: snap!.truncated };
       }
