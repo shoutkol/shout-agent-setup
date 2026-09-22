@@ -61,6 +61,16 @@ properties) so that stripping is a no-op transform, not a compile.
    then separately lists and closes every terminal in the worktree, then removes the worktree —
    each step logged and attempted independently so one failure doesn't skip the rest.
 
+## Images in comments
+
+Pasted images arrive as `https://github.com/user-attachments/assets/<uuid>` links that 404 without
+auth on an internal repo, and the agent host has no GitHub credentials. Before each run the wrapper
+resolves every such URL to GitHub's short-lived pre-signed S3 URL (one authenticated `GET` with
+`redirect: manual`, we only read `Location`), downloads the files on the agent host through a
+one-shot `orca terminal create --command "curl …; exit"` into `/tmp/orca-attachments/pr-<n>/`
+(outside the checkout, so they can't be committed), and rewrites the prompt to point at those
+paths. Max 5 per comment; a failed attachment is logged and left as a URL.
+
 ## API
 
 All routes require `Authorization: Bearer <ORCA_WRAPPER_TOKEN>` (constant-time compare; 401

@@ -31,3 +31,22 @@ export async function react(commentId: number, content: "eyes"): Promise<void> {
 export async function comment(pr: number, body: string): Promise<void> {
   await post(`/repos/${config.githubRepo}/issues/${pr}/comments`, { body });
 }
+
+// GitHub answers an authenticated GET on an attachment URL with a 302 to a pre-signed S3 URL
+// (valid for a few minutes, no auth needed) — anonymous requests get 404 on internal repos.
+// We only want that Location, never the bytes: the agent host downloads them itself.
+export async function resolveAttachment(url: string): Promise<string> {
+  if (config.githubDryRun) {
+    console.log(`[dry-run] resolve attachment ${url}`);
+    return url;
+  }
+  const res = await fetch(url, {
+    redirect: "manual",
+    headers: { Authorization: `token ${config.githubToken}`, "User-Agent": "orca-wrapper" },
+  });
+  const location = res.headers.get("location");
+  if (res.status !== 302 || !location) {
+    throw new Error(`attachment ${url}: expected 302 with Location, got ${res.status}`);
+  }
+  return location;
+}

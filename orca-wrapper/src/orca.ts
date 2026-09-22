@@ -90,6 +90,19 @@ export async function terminalWaitIdle(handle: string, ms: number): Promise<bool
   return result.wait?.satisfied === true;
 }
 
+// True once the terminal's process has exited. A stale handle means the tab is already gone,
+// which for a one-shot command terminal is the same thing as exited.
+export async function terminalWaitExit(handle: string, ms: number): Promise<boolean> {
+  try {
+    const result = await run(["terminal", "wait", "--terminal", handle, "--for", "exit", "--timeout-ms", String(ms)], "timeout");
+    if (result === null) return false;
+    return result.wait?.satisfied === true;
+  } catch (err) {
+    if (err instanceof OrcaError && err.code === "terminal_handle_stale") return true;
+    throw err;
+  }
+}
+
 export async function terminalClose(handle: string): Promise<void> {
   await run(["terminal", "close", "--terminal", handle]);
 }

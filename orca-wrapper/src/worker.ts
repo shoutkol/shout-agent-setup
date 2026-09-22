@@ -9,6 +9,7 @@ import * as orca from "./orca.ts";
 import * as github from "./github.ts";
 import { isDone, stable } from "./logic.ts";
 import { preamble } from "./preamble.ts";
+import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
 
 const POLL_MS = 5_000;
 const BRANCH_POLL_MS = 3_000;
@@ -16,6 +17,8 @@ const BRANCH_POLL_MAX_MS = 120_000;
 const STABILISE_POLL_MS = 5_000;
 const STABILISE_MAX_MS = 30_000;
 const TERMINAL_IDLE_TIMEOUT_MS = 4_000;
+const DOWNLOAD_WAIT_MS = 5_000;
+const DOWNLOAD_MAX_MS = 60_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -61,10 +64,14 @@ export function createWorker(handle: DatabaseSync) {
       // ensureSessionRow (called from enqueue, at request time) guarantees this row exists —
       // it's the only place head_ref is known, since the jobs table doesn't carry it.
       let session = db.getSession(handle, job.pr)!;
+      const worktreeId = session.worktree_id ?? (await ensureWorktree(job.pr, session.head_ref));
+      const prompt = preamble(session.head_ref, job.pr) + "\n\n" + (await stageAttachments(job, worktreeId));
       if (!session.automation_id) {
-        session = await ensureSession(job.pr, session.head_ref, job.prompt);
+        const automationId = await orca.automationCreate(`pr-${job.pr}`, worktreeId, prompt);
+        db.updateSession(handle, job.pr, { automation_id: automationId, state: "ready" });
+        session = db.getSession(handle, job.pr)!;
       } else {
-        await orca.automationEditPrompt(session.automation_id, preamble(session.head_ref, job.pr) + "\n\n" + job.prompt);
+        await orca.automationEditPrompt(session.automation_id, prompt);
       }
 
       const runId = await orca.automationRun(session.automation_id!);
@@ -89,9 +96,9 @@ export function createWorker(handle: DatabaseSync) {
     }
   }
 
-  // Steps a-c from the brief: fresh worktree -> get onto the real PR branch -> one automation
-  // we fire by hand. `firstPrompt` is the raw job prompt; preamble is applied once, here.
-  async function ensureSession(pr: number, headRef: string, firstPrompt: string): Promise<db.Session> {
+  // Fresh worktree, then get it onto the real PR branch. The automation is created separately,
+  // once the first prompt (with any attachments staged) is known.
+  async function ensureWorktree(pr: number, headRef: string): Promise<string> {
     const worktreeId = await orca.worktreeCreate(`pr-${pr}`, headRef);
     db.updateSession(handle, pr, { worktree_id: worktreeId });
 
@@ -105,11 +112,41 @@ export function createWorker(handle: DatabaseSync) {
     } finally {
       await orca.terminalClose(checkoutHandle).catch((err) => console.log(`checkout terminalClose failed pr=${pr}: ${err}`));
     }
+    return worktreeId;
+  }
 
-    const automationId = await orca.automationCreate(`pr-${pr}`, worktreeId, preamble(headRef, pr) + "\n\n" + firstPrompt);
-    db.updateSession(handle, pr, { automation_id: automationId, state: "ready" });
+  // Images in the comment: resolve each GitHub attachment URL to its short-lived signed URL
+  // (needs our token), download them on the agent host via a one-shot terminal, and point the
+  // prompt at the local files. A failed attachment is logged and left as a URL, not fatal.
+  async function stageAttachments(job: db.Job, worktreeId: string): Promise<string> {
+    const urls = extractAttachmentUrls(job.prompt);
+    if (urls.length === 0) return job.prompt;
+    const dir = attachmentDir(job.pr);
+    const files: Array<{ signedUrl: string; path: string }> = [];
+    const attachments: Attachment[] = [];
+    for (const [i, url] of urls.entries()) {
+      try {
+        const signedUrl = await github.resolveAttachment(url);
+        const path = `${dir}/${job.id}-${i + 1}.${extensionOf(signedUrl)}`;
+        files.push({ signedUrl, path });
+        attachments.push({ url, path });
+      } catch (err) {
+        console.log(`attachment skipped pr=${job.pr} ${url}: ${err}`);
+      }
+    }
+    if (files.length === 0) return job.prompt;
 
-    return db.getSession(handle, pr)!;
+    // Signed URLs expire in minutes, so download right away — not from inside the agent's turn.
+    const dlHandle = await orca.terminalCreate(worktreeId, "attachments", downloadCommand(dir, files));
+    try {
+      const deadline = Date.now() + DOWNLOAD_MAX_MS;
+      while (Date.now() < deadline && !(await orca.terminalWaitExit(dlHandle, DOWNLOAD_WAIT_MS))) {
+        // keep waiting
+      }
+    } finally {
+      await orca.terminalClose(dlHandle).catch(() => {});
+    }
+    return rewritePrompt(job.prompt, attachments);
   }
 
   async function pollUntilCheckedOut(worktreeId: string, headRef: string): Promise<void> {
