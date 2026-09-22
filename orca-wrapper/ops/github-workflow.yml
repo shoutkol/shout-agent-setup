@@ -1,0 +1,88 @@
+# Copy into shoutkol/shout as .github/workflows/orca.yml
+#
+# Wires PR comments starting with "/orca" to orca-wrapper running on the GCE
+# Orca desktop, and tells it to drop a PR's session once the PR closes.
+# Needs two repo secrets (Settings -> Secrets and variables -> Actions):
+#   ORCA_WRAPPER_URL    https://orca.shouttgt.com
+#   ORCA_WRAPPER_TOKEN  the token in ~/.config/orca-wrapper/env on the VM
+# See orca-wrapper/ops/README.md.
+name: orca
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  prompt:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/orca')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Look up PR branches
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")"
+          echo "head_ref=$(echo "$pr_json" | jq -r '.head.ref')" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$(echo "$pr_json" | jq -r '.base.ref')" >> "$GITHUB_OUTPUT"
+
+      - name: Send prompt to orca-wrapper
+        env:
+          ORCA_WRAPPER_URL: ${{ secrets.ORCA_WRAPPER_URL }}
+          ORCA_WRAPPER_TOKEN: ${{ secrets.ORCA_WRAPPER_TOKEN }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+          # COMMENT_BODY is attacker-controlled (anyone who can comment on a
+          # PR). Never interpolate it into a shell string -- jq --arg reads
+          # it strictly as a JSON string value, never as shell or jq syntax.
+          payload="$(jq -n \
+            --arg head_ref "$HEAD_REF" \
+            --arg base_ref "$BASE_REF" \
+            --argjson comment_id "$COMMENT_ID" \
+            --arg body "$COMMENT_BODY" \
+            --arg author "$COMMENT_AUTHOR" \
+            '{head_ref: $head_ref, base_ref: $base_ref, comment_id: $comment_id, body: $body, author: $author}')"
+
+          curl --fail-with-body -sS -X POST \
+            "$ORCA_WRAPPER_URL/pr/${{ github.event.issue.number }}/prompt" \
+            -H "Authorization: Bearer $ORCA_WRAPPER_TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data "$payload"
+
+  close:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Close orca-wrapper session
+        env:
+          ORCA_WRAPPER_URL: ${{ secrets.ORCA_WRAPPER_URL }}
+          ORCA_WRAPPER_TOKEN: ${{ secrets.ORCA_WRAPPER_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 202 = session closed, 404 = there was never one to close -- both
+          # are a normal outcome, so only fail the job on anything else.
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+            "$ORCA_WRAPPER_URL/pr/${{ github.event.pull_request.number }}" \
+            -H "Authorization: Bearer $ORCA_WRAPPER_TOKEN")"
+          echo "orca-wrapper responded $code"
+          case "$code" in
+            202|404) exit 0 ;;
+            *) exit 1 ;;
+          esac

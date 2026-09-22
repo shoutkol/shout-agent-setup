@@ -4,7 +4,7 @@
 # Creates and removes: one git worktree (repo-wrapper-poc on the droplet), one automation, its terminal.
 set -u
 export PATH="$HOME/.local/bin:$PATH"
-REPO_ID="62e08675-13e7-4ec0-a479-b9742aef62cf"      # shoutkol/shout on the droplet (from gce-inventory.sh)
+REPO_ID="${ORCA_REPO_ID:-62e08675-13e7-4ec0-a479-b9742aef62cf}"   # shoutkol/shout bound to the droplet SSH host; override with ORCA_REPO_ID on another Orca instance
 NAME="wrapper-poc-$(date +%H%M%S)"
 j() { python3 -c "import json,sys; d=json.load(sys.stdin); $1" 2>&1; }
 p() { printf '\n== %s\n' "$*"; }

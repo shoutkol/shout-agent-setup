@@ -1,0 +1,17 @@
+# orca-wrapper reverse proxy -- public HTTPS entry for the PR-comment wrapper.
+#
+# Plain HTTP is forbidden here on purpose: ORCA_WRAPPER_TOKEN is a static
+# bearer token sent on every request (from the GitHub Actions workflow and by
+# hand for debugging). Over cleartext HTTP it travels in the open -- anyone on
+# the network path (wifi, a transparent proxy, the cloud network fabric) can
+# read it, then call the wrapper's endpoints directly. That is remote code
+# execution against the Orca desktop sitting behind it. Caddy auto-provisions
+# a Let's Encrypt cert for this domain and redirects HTTP -> HTTPS by default
+# -- do not add a `http://` site block or `auto_https off` to this file.
+orca.shouttgt.com {
+	reverse_proxy 127.0.0.1:8787
+
+	log {
+		output file /var/log/caddy/orca.log
+	}
+}

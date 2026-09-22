@@ -1,0 +1,33 @@
+# orca-wrapper -- PR-comment wrapper around the Orca CLI.
+#
+# This MUST run as a systemd --user unit, not a system service: the wrapper
+# shells out to `orca`, which only works while the Orca desktop app is
+# running inside this user's graphical session. A system service runs
+# outside any user session and would never see the app.
+#
+# Install path: ~/.config/systemd/user/orca-wrapper.service (install.sh does
+# this for you). Also requires `loginctl enable-linger <user>` so the user
+# service manager -- and this unit with it -- survives logout; install.sh
+# does that too.
+[Unit]
+Description=orca-wrapper (PR-comment wrapper for Orca)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/orca-wrapper/env
+# The orca launcher lives in ~/.local/bin and itself shells out to `gh` --
+# both must be reachable from systemd --user's minimal, non-login PATH.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
+WorkingDirectory=%h/shout-agent-setup/orca-wrapper
+# Hardcode the SYSTEM node, not whatever nvm/fnm shims into an interactive
+# shell -- systemd --user does not source ~/.bashrc, so a user-level node
+# would simply not exist here even though `node -v` finds it in your shell.
+# --disable-warning: node:sqlite is still flagged experimental on 22.x and would print a warning on every start.
+ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning %h/shout-agent-setup/orca-wrapper/src/server.ts
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
