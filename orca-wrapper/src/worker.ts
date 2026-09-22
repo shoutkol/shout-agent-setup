@@ -7,15 +7,13 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { isDone, stable } from "./logic.ts";
-import { preamble } from "./preamble.ts";
+import { isDone, isLaunchFrame, stable } from "./logic.ts";
+import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
 
 const POLL_MS = 5_000;
 const BRANCH_POLL_MS = 3_000;
 const BRANCH_POLL_MAX_MS = 120_000;
-const STABILISE_POLL_MS = 5_000;
-const STABILISE_MAX_MS = 30_000;
 const TERMINAL_IDLE_TIMEOUT_MS = 4_000;
 const DOWNLOAD_WAIT_MS = 5_000;
 const DOWNLOAD_MAX_MS = 60_000;
@@ -178,6 +176,7 @@ export function createWorker(handle: DatabaseSync) {
     // previous live session is gone Orca silently starts a new one, and the stored handle would
     // point at a dead tab. The row keeps the latest handle only so teardown has something to close.
     let terminalHandle: string | undefined;
+    let prevCapturedAt: string | null = null;
 
     while (Date.now() < deadline) {
       const runs = await orca.automationRuns(session.automation_id!);
@@ -200,39 +199,23 @@ export function createWorker(handle: DatabaseSync) {
         return { outcome: "error", reason: run.error ? String(run.error) : `run ${run.status}` };
       }
 
+      // Four things must agree before we trust a snapshot, because each alone has fooled us:
+      //   status      — "completed" fires ~3s in on a fresh session, before the agent answered;
+      //   tui-idle    — trivially true while the shell is still launching the agent (no TUI yet);
+      //   launch frame — Orca's first capture is that pre-TUI frame echoing our own prompt;
+      //   stability   — the capture is replaced later; two polls with the same capturedAt.
       const idle = terminalHandle ? await orca.terminalWaitIdle(terminalHandle, TERMINAL_IDLE_TIMEOUT_MS) : false;
-      if (isDone(run.status, idle) === "done") {
-        const snapshot = await stabiliseOutput(session.automation_id!, runId);
-        return { outcome: "done", content: snapshot.content, truncated: snapshot.truncated };
+      const snap = run.outputSnapshot;
+      const capturedAt = snap?.capturedAt ?? null;
+      const realAnswer = snap != null && !isLaunchFrame(snap.content, PREAMBLE_MARKER);
+      if (isDone(run.status, idle) === "done" && realAnswer && stable([prevCapturedAt, capturedAt])) {
+        return { outcome: "done", content: snap!.content, truncated: snap!.truncated };
       }
+      prevCapturedAt = capturedAt;
 
       await sleep(POLL_MS);
     }
     return { outcome: "error", reason: `timed out after ${config.runTimeoutMin} minutes` };
-  }
-
-  // A fresh session's first output capture can be a raw TUI frame that Orca later replaces with
-  // the clean final message — wait for outputSnapshot.capturedAt to repeat before trusting it.
-  async function stabiliseOutput(automationId: string, runId: string): Promise<{ content: string; truncated: boolean }> {
-    const deadline = Date.now() + STABILISE_MAX_MS;
-    let prevCapturedAt: string | null = null;
-    let last: { content: string; capturedAt: string; truncated: boolean } | null = null;
-
-    while (Date.now() < deadline) {
-      const runs = await orca.automationRuns(automationId);
-      const run = runs.find((r) => r.id === runId);
-      const snap = run?.outputSnapshot ?? null;
-      const curCapturedAt = snap?.capturedAt ?? null;
-      if (snap) last = snap;
-
-      if (stable([prevCapturedAt, curCapturedAt]) && snap) {
-        return { content: snap.content, truncated: snap.truncated };
-      }
-      prevCapturedAt = curCapturedAt;
-      await sleep(STABILISE_POLL_MS);
-    }
-    // Give up after 30s rather than failing the whole job — use whatever we last captured.
-    return last ? { content: last.content, truncated: last.truncated } : { content: "", truncated: false };
   }
 
   async function postResult(job: db.Job, content: string, truncated: boolean): Promise<void> {

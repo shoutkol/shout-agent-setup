@@ -43,3 +43,17 @@ export function stable(capturedAts: ReadonlyArray<string | null>): string | unde
   }
   return undefined;
 }
+
+// Orca's first output capture on a fresh session is the raw terminal frame from BEFORE the agent
+// TUI came up: the shell prompt, sudo's banner, and the `claude '--dangerously-skip-permissions'
+// '<our whole prompt>'` launch line. At that moment `status` is already "completed" and
+// `tui-idle` is trivially true (there is no TUI yet), so the two-signal check passes and the frame
+// got posted to a PR verbatim (PR 482). The frame always echoes the launch flag and our preamble;
+// a real answer never contains the preamble verbatim and never ends in a shell prompt.
+export function isLaunchFrame(content: string, preambleMarker: string): boolean {
+  const c = content.trim();
+  if (c === "") return true;
+  if (c.includes("--dangerously-skip-permissions")) return true;
+  if (preambleMarker && c.includes(preambleMarker)) return true;
+  return /\$\s*$/.test(c);
+}
