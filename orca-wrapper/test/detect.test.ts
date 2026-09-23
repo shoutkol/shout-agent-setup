@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isDone, isLaunchFrame, stable } from "../src/logic.ts";
+import { isDone, isLaunchFrame, launchMarker, stable } from "../src/logic.ts";
 
 test("fresh session: early completed but not idle -> pending", () => {
   assert.strictEqual(isDone("completed", false), "pending");
@@ -63,4 +63,26 @@ test("launch frame: real answers pass, even short ones or ones mentioning branch
     false,
   );
   assert.strictEqual(isLaunchFrame("Costs are in USD ($) — see the $ column.", MARKER), false);
+});
+
+test("launch frame: our prompt echoed back at the top (or as a > quote) is not an answer", () => {
+  assert.strictEqual(isLaunchFrame(`${MARKER} \`feat/x\` of shoutkol/shout …`, MARKER), true);
+  assert.strictEqual(isLaunchFrame(`> ${MARKER} \`feat/x\``, MARKER), true);
+});
+
+test("launch frame: answers that only look like one pass (H-07)", () => {
+  assert.strictEqual(isLaunchFrame("ราคา 5$", MARKER), false);
+  assert.strictEqual(isLaunchFrame("ค่าใช้จ่ายรวม 12$", MARKER), false);
+  assert.strictEqual(isLaunchFrame("The agent runs as `claude --dangerously-skip-permissions`, so it never asks.", MARKER), false);
+  assert.strictEqual(isLaunchFrame(`The preamble says: "${MARKER} \`feat/x\`…" — that's why I pulled first.`, MARKER), false);
+});
+
+test("launch frame: a short task prompt gives no marker, so answers containing it pass (H-06)", () => {
+  for (const prompt of ["ok", "yes", "token", "ช่วยดูหน่อย"]) {
+    assert.strictEqual(launchMarker(prompt), "", prompt);
+  }
+  assert.strictEqual(isLaunchFrame("Looks fine to me — the token refresh is ok.", launchMarker("ok")), false);
+  assert.strictEqual(isLaunchFrame('"token" หมายถึงเรื่องไหนครับ', launchMarker("token")), false);
+  const long = "You are working in a git worktree checked out on branch `claude/WO-74-x`";
+  assert.strictEqual(launchMarker(long), long.slice(0, 40));
 });
