@@ -77,14 +77,29 @@ export function stable(capturedAts: ReadonlyArray<string | null>): string | unde
 // TUI came up: the shell prompt, sudo's banner, and the `claude '--dangerously-skip-permissions'
 // '<our whole prompt>'` launch line. At that moment `status` is already "completed" and
 // `tui-idle` is trivially true (there is no TUI yet), so the two-signal check passes and the frame
-// got posted to a PR verbatim (PR 482). The frame always echoes the launch flag and our preamble;
-// a real answer never contains the preamble verbatim and never ends in a shell prompt.
-export function isLaunchFrame(content: string, preambleMarker: string): boolean {
+// got posted to a PR verbatim (PR 482). Each rule below matches that frame's shape specifically,
+// because a looser match holds back real answers until the run times out (seen live: `/orca
+// token` on a WO-PR hung 60 min — its marker was "token", and the answer said "token"):
+//   - the launch line itself: `claude` + the flag *in shell quotes*. An answer that merely
+//     mentions the flag writes it bare (`claude --dangerously-skip-permissions`).
+//   - our own prompt echoed back, i.e. the capture STARTS with the marker (optionally as a
+//     "> " quote). An answer that quotes our preamble somewhere in the middle is still an answer.
+//   - a capture that ends on a shell prompt: `user@host:path$` or a prompt ending " $". Not any
+//     trailing `$` — "ราคา 5$" is an answer.
+export function isLaunchFrame(content: string, marker: string): boolean {
   const c = content.trim();
   if (c === "") return true;
-  if (c.includes("--dangerously-skip-permissions")) return true;
-  if (preambleMarker && c.includes(preambleMarker)) return true;
-  return /\$\s*$/.test(c);
+  if (/claude\s+'--dangerously-skip-permissions'/.test(c)) return true;
+  if (marker && c.replace(/^>\s*/, "").startsWith(marker)) return true;
+  const lastLine = c.split("\n").pop()!.trim();
+  return /^[\w.-]+@[\w.-]+:\S*[$#]$/.test(lastLine) || /(^|\s)\$$/.test(lastLine);
+}
+
+// Marker for a task prompt's echo: its first 40 chars — but only when there are 40. A shorter
+// prompt ("ok", "token", "yes") makes a marker that ordinary answers contain.
+export function launchMarker(prompt: string): string {
+  const head = prompt.trim().slice(0, 40);
+  return head.length === 40 ? head : "";
 }
 
 // Git branch for a Notion work order: claude/WO-<wo>-<slug>, ASCII letters/digits only, spaces
