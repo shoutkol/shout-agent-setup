@@ -34,6 +34,7 @@ Read once at startup in `src/config.ts`.
 | `DB_PATH` | no | `${HOME}/.local/share/orca-wrapper/state.sqlite` | SQLite file (dir is created if missing). |
 | `IDLE_DAYS` | no | `15` | Sessions idle this long are closed by the hourly sweep. |
 | `RUN_TIMEOUT_MIN` | no | `60` | Max time to wait for one automation run to finish. |
+| `BUSY_WAIT_MIN` | no | `10` | Before a session's next run, max time to wait for its agent terminal to go idle (a timed-out or pre-restart run may still be going). Past it, the job fails with a note instead of running on top. |
 
 On startup `openDb` adds any nullable column the current schema has but the deployed database
 lacks (e.g. `sessions.prompt_template`), so a plain update keeps existing sessions. The one change

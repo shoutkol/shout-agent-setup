@@ -171,3 +171,21 @@ test("POST /pr/{n}/prompt: bare /orca -> 202 help; an unsafe head_ref -> 400 and
     close();
   }
 });
+
+test("POST /pr/{n}/prompt: the same comment delivered twice (workflow re-run) is one job", async () => {
+  const { server, close, db } = startServer();
+  await new Promise<void>((resolve) => server.on("listening", () => resolve()));
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const body = JSON.stringify({ head_ref: "feat/x", base_ref: "dev", comment_id: 4242, body: "/orca hi", author: "alice" });
+  try {
+    const first = (await (await post(base, "/pr/9/prompt", body)).json()) as { job_id: number; deduped?: boolean };
+    const second = (await (await post(base, "/pr/9/prompt", body)).json()) as { job_id: number; deduped?: boolean };
+    assert.strictEqual(second.job_id, first.job_id);
+    assert.strictEqual(second.deduped, true);
+    assert.strictEqual(first.deduped, undefined);
+    const n = (db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE comment_id = 4242").get() as { n: number }).n;
+    assert.strictEqual(n, 1);
+  } finally {
+    close();
+  }
+});

@@ -18,6 +18,10 @@ const BRANCH_POLL_MAX_MS = 120_000;
 const TERMINAL_IDLE_TIMEOUT_MS = 4_000;
 const DOWNLOAD_WAIT_MS = 5_000;
 const DOWNLOAD_MAX_MS = 60_000;
+// Before sending the next prompt to a session that has already run, wait (config.busyWaitMin) for
+// its agent to go idle: a run the wrapper gave up on (timeout) or lost track of (restart) is often
+// still going, and a second `automations run` on top of it forks the session.
+const AGENT_IDLE_POLL_MS = 10_000;
 
 const NOTION_UPDATE_KIND = "notion-update";
 
@@ -31,19 +35,26 @@ function sleep(ms: number): Promise<void> {
 
 type CompletionResult = { outcome: "done"; content: string; truncated: boolean } | { outcome: "error"; reason: string };
 
+export type EnqueueResult =
+  | { jobId: number; position: number; deduped?: true }
+  | { rejected: "closing" };
+
+export type CloseResult = "closed" | "closing" | false;
+
 export function createWorker(handle: DatabaseSync) {
   // Session keys currently being processed, so tick() never claims a second job for the same
   // session while the first is still in flight (claimNextJob already prevents this at the DB
   // level too — this set just avoids a wasted claim attempt every tick).
   const active = new Set<string>();
 
-  function enqueuePrJob(
-    pr: number,
-    headRef: string,
-    commentId: number,
-    author: string,
-    prompt: string,
-  ): { jobId: number; position: number } {
+  // Re-running the workflow redelivers the same comment (same id): hand back the job we already
+  // have instead of running the prompt twice. A session that is shutting down (/orca stop while a
+  // job runs) takes nothing new — it would run against an automation that's about to be removed.
+  function enqueuePrJob(pr: number, headRef: string, commentId: number, author: string, prompt: string): EnqueueResult {
+    const dup = db.findJobByCommentId(handle, commentId);
+    if (dup) return { jobId: dup.id, position: db.positionOf(handle, dup), deduped: true };
+    const existing = db.getSessionByPr(handle, pr);
+    if (existing?.state === "closing") return { rejected: "closing" };
     const session = db.ensurePrSession(handle, pr, headRef);
     const { id, position } = db.enqueueJob(handle, session.key, commentId, author, prompt);
     tick();
@@ -55,6 +66,7 @@ export function createWorker(handle: DatabaseSync) {
   // using THIS request's prompt, not the session's original one); otherwise a fresh task session
   // is created, `prompt` is kept on it as `prompt_template` for reference, and this is its first
   // job. Either way, buildPrompt renders the job's own `prompt` at run time (see logic.renderPrompt).
+  // The same prompt already waiting or running for the WO is a duplicate delivery, not a new ask.
   function enqueueTask(
     wo: number,
     notionUrl: string,
@@ -63,10 +75,13 @@ export function createWorker(handle: DatabaseSync) {
     branch: string,
     repoAppLine: string | null,
     prompt: string,
-  ): { key: string; jobId: number; position: number } {
+  ): { key: string } & EnqueueResult {
     const key = db.taskKey(wo);
     const existing = db.getSession(handle, key);
     if (existing && existing.state !== "closed") {
+      if (existing.state === "closing") return { key, rejected: "closing" };
+      const dup = db.findActiveDuplicate(handle, key, prompt);
+      if (dup) return { key, jobId: dup.id, position: db.positionOf(handle, dup), deduped: true };
       const { id, position } = db.enqueueJob(handle, key, null, author, prompt);
       tick();
       return { key, jobId: id, position };
@@ -102,6 +117,13 @@ export function createWorker(handle: DatabaseSync) {
       if (!session.worktree_id) {
         await ensureWorktree(session);
         session = db.getSession(handle, job.session_key)!;
+      }
+
+      if (session.automation_id && !(await waitUntilAgentIdle(session))) {
+        throw new Error(
+          "the agent is still busy with an earlier request (one the wrapper stopped waiting for, or lost " +
+            "track of in a restart). Nothing was sent; ask again once it has finished",
+        );
       }
 
       const prompt = await buildPrompt(session, job, session.worktree_id!);
@@ -141,6 +163,24 @@ export function createWorker(handle: DatabaseSync) {
     } finally {
       await maybeFinishClosing(job.session_key).catch((e) => console.log(`deferred close failed key=${job.session_key}: ${e}`));
     }
+  }
+
+  // True once the session's agent terminal reports tui-idle. No handle yet (first run) or a handle
+  // Orca no longer knows (the agent is gone; Orca starts a fresh one on the next run) both count
+  // as idle — there is nothing to run on top of.
+  async function waitUntilAgentIdle(session: db.Session): Promise<boolean> {
+    if (!session.terminal_handle) return true;
+    const deadline = Date.now() + config.busyWaitMin * 60_000;
+    while (Date.now() < deadline) {
+      try {
+        if (await orca.terminalWaitIdle(session.terminal_handle, AGENT_IDLE_POLL_MS)) return true;
+      } catch (err) {
+        if (err instanceof orca.OrcaError && err.code === "terminal_handle_stale") return true;
+        throw err;
+      }
+      await sleep(1_000); // `terminal wait` normally blocks for the full poll; don't spin if it returns early
+    }
+    return false;
   }
 
   // The worktreeId prefix for reaching the BASE checkout (not any worktree) via `orca terminal
@@ -401,17 +441,38 @@ export function createWorker(handle: DatabaseSync) {
   }
 
   // Never tears down a session while a job is running for it — defer to maybeFinishClosing,
-  // called from processJob's `finally` once the in-flight job settles.
-  async function closeSession(key: string): Promise<boolean> {
+  // called from processJob's `finally` once the in-flight job settles. "closing" means exactly
+  // that: the current job still finishes and posts its answer first.
+  async function closeSession(key: string): Promise<CloseResult> {
     const session = db.getSession(handle, key);
     if (!session || session.state === "closed") return false;
     db.failQueuedJobs(handle, key, "session closed");
     if (active.has(key)) {
       db.updateSession(handle, key, { state: "closing" });
-      return true;
+      return "closing";
     }
     await teardown(session);
-    return true;
+    return "closed";
+  }
+
+  // Jobs that were running when the wrapper last stopped (db.markRunningJobsFailed at startup).
+  // Their answer is lost and the agent may or may not have acted, so tell each PR rather than
+  // leave only the 👀 reaction behind. A task with no PR yet has nowhere to say it but the log.
+  async function notifyInterrupted(jobs: db.Job[]): Promise<void> {
+    for (const job of jobs) {
+      const session = db.getSession(handle, job.session_key);
+      if (!session?.pr || job.kind === NOTION_UPDATE_KIND) {
+        console.log(`restart interrupted job=${job.id} key=${job.session_key} (no PR to tell)`);
+        continue;
+      }
+      await github
+        .comment(
+          session.pr,
+          "🐳 orca: interrupted — the wrapper restarted while this request was running, so no answer was " +
+            "captured. The agent may already have changed files or pushed; check the branch before asking again.",
+        )
+        .catch((err) => console.log(`restart notice failed key=${job.session_key}: ${err}`));
+    }
   }
 
   async function maybeFinishClosing(key: string): Promise<void> {
@@ -448,7 +509,7 @@ export function createWorker(handle: DatabaseSync) {
     }
   }
 
-  return { enqueuePrJob, enqueueTask, tick, closeSession, sweepIdle };
+  return { enqueuePrJob, enqueueTask, tick, closeSession, sweepIdle, notifyInterrupted };
 }
 
 export type Worker = ReturnType<typeof createWorker>;

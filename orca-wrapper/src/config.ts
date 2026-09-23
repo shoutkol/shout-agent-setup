@@ -41,4 +41,5 @@ export const config = {
   dbPath,
   idleDays: Number(process.env.IDLE_DAYS ?? 15),
   runTimeoutMin: Number(process.env.RUN_TIMEOUT_MIN ?? 60),
+  busyWaitMin: Number(process.env.BUSY_WAIT_MIN ?? 10),
 };
