@@ -60,14 +60,20 @@ properties) so that stripping is a no-op transform, not a compile.
 ## The four Orca quirks this wrapper works around
 
 1. **`worktree create` never checks out your branch.** It always creates a *new* branch at the
-   base commit. To actually land on the PR's real head branch, we run a throwaway `git fetch &&
-   git checkout` in a terminal, then poll `worktree list` until Orca's own `branch` field flips to
-   `refs/heads/<head_ref>` — `terminal wait --for exit` does not report the shell exiting, so that
-   signal isn't available.
+   base commit. We run a throwaway `git fetch && git checkout -B` in a terminal, then poll
+   `worktree list` until Orca's own `branch` field shows the branch we asked for — `terminal wait
+   --for exit` does not report the shell exiting, so that signal isn't available. A PR session's
+   worktree goes on its own `orca/pr-<n>-<id>` branch tracking `origin/<head_ref>`, not on
+   `<head_ref>` itself: git won't check out a branch another worktree of the same clone already
+   has, and on the agent host other sessions often do. The agent pushes with `HEAD:<head_ref>`.
+   The worktree is recorded on the session only once the checkout lands; a failed checkout
+   removes it, so the next prompt starts over instead of running on Orca's branch.
 2. **One automation run per session, strictly sequential.** Firing a second `automations run`
    while one is still in flight on the same worktree makes Orca silently fork a second agent
    session. The worker enforces "no running job for this session" at the DB level before claiming
-   the next queued one; different sessions (PRs or tasks) still run concurrently.
+   the next queued one, and before each run after the first it waits (`BUSY_WAIT_MIN`) for the
+   agent terminal to go idle — a run the wrapper timed out on or lost in a restart may still be
+   going. Different sessions (PRs or tasks) still run concurrently.
 3. **Completion needs two signals, not one.** An automation run's `status` alone is unreliable: on
    a fresh session it flips to `"completed"` ~3s after dispatch, well before the agent has
    answered, while on a reused session it stays `"dispatched"` until the real end; `tui-idle` alone
@@ -79,6 +85,16 @@ properties) so that stripping is a no-op transform, not a compile.
 4. **`automations remove` does not close its terminal.** Closing a session removes the automation,
    then separately lists and closes every terminal in the worktree, then removes the worktree —
    each step logged and attempted independently so one failure doesn't skip the rest.
+
+## Long answers
+
+Orca's run snapshot stops at ~8 KB, with no truncation flag. When a snapshot is that long, the
+worker runs a one-line command in the session's worktree that prints the agent's final message
+from its Claude transcript (`~/.claude/projects/<cwd>/`), gzipped and base64'd, and reads it
+back with `orca terminal read` (which keeps ~32 KB — about 80–100 KB of prose). It's used only if
+it starts the way the snapshot does; otherwise the snapshot is posted with a warning. An answer
+over 60,000 chars (GitHub's comment limit is 65,536) posts its first part plus a secret gist with
+the full text, or several `(part i/n)` comments if the token can't create gists.
 
 ## Images in comments
 
@@ -143,7 +159,10 @@ through its Notion connector):
 single dashes, capped at 40 chars (see `branchFor` in `src/logic.ts`); a title with nothing
 sluggable (e.g. all-Thai) yields just `claude/WO-<wo>`. `POST /tasks` on a WO that already has a
 live session enqueues that request's own `prompt` as a follow-up job instead of starting a new one
-(the session's original `prompt` is not reused or appended).
+(the session's original `prompt` is not reused or appended). One work order is one branch and one
+PR: dispatching a WO again after its session closed carries on from the branch already on origin
+(never resets it to `dev`), and answers on the PR that branch already has — reopening it if it
+was closed without merging. Only a merged PR gets a new one for new commits.
 
 **`prompt`** is the task's actual first-run instructions to the agent — required, non-empty,
 authored in Notion and passed through by n8n exactly as written (there's no more hard-coded
@@ -164,8 +183,9 @@ Notion-writeback job (below) keeps its own hard-coded prompt and is never render
 
 **Two-run flow**, driven from `worker.ts` — unchanged except for where the first prompt comes from:
 
-1. The wrapper creates a fresh worktree, force-creates the branch off `origin/dev`, and pushes it
-   immediately (before the agent runs at all) so the branch always exists on origin. The agent is
+1. The wrapper creates a fresh worktree and puts it on the branch: from `origin/<branch>` if it
+   already exists, otherwise created off `origin/dev` and pushed immediately (before the agent runs
+   at all) so the branch always exists on origin. The agent is
    told, via the rendered `prompt`, to read the Notion page as its spec, implement it, and always
    `git push` before finishing — even if blocked, so the PR is where open questions get discussed.
 2. Once that run completes, the wrapper checks `GET /repos/{repo}/compare/dev...<branch>`. If

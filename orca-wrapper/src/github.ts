@@ -83,7 +83,8 @@ export async function createPullRequest(params: {
 }): Promise<{ number: number; html_url: string }> {
   if (config.githubDryRun) {
     console.log(`[dry-run] POST /repos/${config.githubRepo}/pulls ${JSON.stringify(params)}`);
-    return { number: 0, html_url: "https://example.invalid/pr/0" };
+    // Non-zero: PR 0 is falsy, and `if (session.pr)` then treated the task as having no PR yet.
+    return { number: 99999, html_url: "https://example.invalid/pr/99999" };
   }
   const res = await fetch(`${API}/repos/${config.githubRepo}/pulls`, {
     method: "POST",
@@ -112,4 +113,61 @@ export async function pullState(pr: number): Promise<"open" | "closed"> {
   }
   const body = (await res.json()) as { state: string };
   return body.state === "closed" ? "closed" : "open";
+}
+
+// The PR (any state) whose head is `branch` in this repo, newest first — for a re-dispatched work
+// order, whose branch may already have one. Dry-run: none.
+export async function findPullByHead(
+  branch: string,
+): Promise<{ number: number; html_url: string; state: "open" | "closed"; merged: boolean } | null> {
+  if (config.githubDryRun) {
+    console.log(`[dry-run] GET /repos/${config.githubRepo}/pulls?head=…:${branch}&state=all`);
+    return null;
+  }
+  const owner = config.githubRepo.split("/")[0];
+  const q = new URLSearchParams({ head: `${owner}:${branch}`, state: "all", sort: "created", direction: "desc" });
+  const res = await fetch(`${API}/repos/${config.githubRepo}/pulls?${q}`, { headers: authHeaders() });
+  if (!res.ok) {
+    const snippet = (await res.text()).slice(0, 500);
+    throw new Error(`github list PRs for ${branch} failed: ${res.status} ${snippet}`);
+  }
+  const list = (await res.json()) as Array<{ number: number; html_url: string; state: string; merged_at: string | null }>;
+  const pr = list[0];
+  if (!pr) return null;
+  return { number: pr.number, html_url: pr.html_url, state: pr.state === "closed" ? "closed" : "open", merged: pr.merged_at != null };
+}
+
+export async function reopenPullRequest(pr: number): Promise<void> {
+  if (config.githubDryRun) {
+    console.log(`[dry-run] PATCH /repos/${config.githubRepo}/pulls/${pr} {"state":"open"}`);
+    return;
+  }
+  const res = await fetch(`${API}/repos/${config.githubRepo}/pulls/${pr}`, {
+    method: "PATCH",
+    headers: { ...authHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ state: "open" }),
+  });
+  if (!res.ok) {
+    const snippet = (await res.text()).slice(0, 500);
+    throw new Error(`github reopen PR #${pr} failed: ${res.status} ${snippet}`);
+  }
+}
+
+// Secret gist holding a full answer too long for one comment. Needs the token's `gist` scope
+// (gh's default login has it); the caller falls back to several comments if this throws.
+export async function createGist(filename: string, content: string, description: string): Promise<string> {
+  if (config.githubDryRun) {
+    console.log(`[dry-run] POST /gists ${filename} (${content.length} chars)`);
+    return "https://gist.example.invalid/dry-run";
+  }
+  const res = await fetch(`${API}/gists`, {
+    method: "POST",
+    headers: { ...authHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ description, public: false, files: { [filename]: { content } } }),
+  });
+  if (!res.ok) {
+    const snippet = (await res.text()).slice(0, 300);
+    throw new Error(`github create gist failed: ${res.status} ${snippet}`);
+  }
+  return ((await res.json()) as { html_url: string }).html_url;
 }
