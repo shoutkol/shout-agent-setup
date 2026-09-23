@@ -35,9 +35,10 @@ Read once at startup in `src/config.ts`.
 | `IDLE_DAYS` | no | `15` | Sessions idle this long are closed by the hourly sweep. |
 | `RUN_TIMEOUT_MIN` | no | `60` | Max time to wait for one automation run to finish. |
 
-`openDb` only ever runs `CREATE TABLE IF NOT EXISTS` — there is no migration path from the
-PR-only `sessions`/`jobs` schema (keyed by `pr`) to the current key-keyed one. Upgrading a
-deployed instance past that schema change needs a fresh database: stop the service, `rm
+On startup `openDb` adds any nullable column the current schema has but the deployed database
+lacks (e.g. `sessions.prompt_template`), so a plain update keeps existing sessions. The one change
+it can't patch is the old PR-only `sessions`/`jobs` schema (keyed by `pr`) — `openDb` refuses to
+start on it, and upgrading past it needs a fresh database: stop the service, `rm
 ${DB_PATH:-~/.local/share/orca-wrapper}/state.sqlite*`, then restart (see "Update" in
 [`ops/README.md`](ops/README.md)). This drops in-flight sessions/jobs, same as any other state
 loss — there's nothing to carry forward, since PR numbers and WO numbers aren't reused.

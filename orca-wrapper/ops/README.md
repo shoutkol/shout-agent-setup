@@ -105,9 +105,9 @@ systemctl --user restart orca-wrapper
 ```
 
 If this update adds the `/tasks` (Notion work order) routes, the `sessions`/`jobs` schema changed
-from PR-keyed to key-keyed and `openDb` does not migrate old rows: stop the service, `rm
+from PR-keyed to key-keyed and the wrapper refuses to start on the old database: stop the service, `rm
 ~/.local/share/orca-wrapper/state.sqlite*`, then start it again (see orca-wrapper's own
-`README.md`).
+`README.md`). Newer columns on the key-keyed schema are added automatically on startup.
 
 `ops/Caddyfile` and `ops/orca-wrapper.service` are files on disk, not
 symlinks -- a plain `git pull` does not re-apply them. Re-run

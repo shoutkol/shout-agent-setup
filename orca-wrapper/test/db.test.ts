@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
   openDb,
   ensurePrSession,
@@ -127,4 +131,53 @@ test("ensurePrSession reuses the existing session for a PR that already has one 
   assert.strictEqual(session.kind, "task");
 
   db.close();
+});
+
+// A database created before a column was added: CREATE TABLE IF NOT EXISTS skips the existing
+// table, so openDb must add the column itself or the first INSERT naming it throws.
+function withLegacyDb(schema: string, fn: (path: string) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), "orca-wrapper-db-"));
+  const path = join(dir, "state.sqlite");
+  try {
+    const legacy = new DatabaseSync(path);
+    legacy.exec(schema);
+    legacy.close();
+    fn(path);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("openDb adds columns missing from a database created by an older schema", () => {
+  withLegacyDb(
+    `CREATE TABLE sessions (key TEXT PRIMARY KEY, kind TEXT NOT NULL, pr INTEGER, head_ref TEXT, worktree_id TEXT,
+       automation_id TEXT, terminal_handle TEXT, state TEXT NOT NULL, created_at INTEGER NOT NULL,
+       last_activity INTEGER NOT NULL, notion_url TEXT, wo INTEGER, title TEXT, repo_app TEXT);
+     CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, session_key TEXT NOT NULL, kind TEXT,
+       comment_id INTEGER, author TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, run_id TEXT,
+       output TEXT, error TEXT, created_at INTEGER NOT NULL, finished_at INTEGER);
+     INSERT INTO sessions (key, kind, pr, head_ref, state, created_at, last_activity, wo)
+       VALUES ('wo-73', 'task', 486, 'claude/WO-73-x', 'ready', 1, 1, 73);`,
+    (path) => {
+      const db = openDb(path);
+      const session = ensureTaskSession(db, 74, "https://notion.so/wo-74", "Test", "claude/WO-74-test", "shout-web", "go");
+      assert.strictEqual(session.prompt_template, "go");
+      assert.strictEqual(getSession(db, taskKey(73))?.pr, 486); // existing rows survive
+      db.close();
+
+      const reopened = openDb(path); // idempotent: the column is there now
+      assert.strictEqual(getSession(reopened, taskKey(74))?.prompt_template, "go");
+      reopened.close();
+    },
+  );
+});
+
+test("openDb refuses the old PR-keyed schema with a message saying how to fix it", () => {
+  withLegacyDb(
+    `CREATE TABLE sessions (pr INTEGER PRIMARY KEY, head_ref TEXT NOT NULL, worktree_id TEXT, automation_id TEXT,
+       terminal_handle TEXT, state TEXT NOT NULL, created_at INTEGER NOT NULL, last_activity INTEGER NOT NULL);`,
+    (path) => {
+      assert.throws(() => openDb(path), /old PR-keyed schema.*delete the state\.sqlite\* files/);
+    },
+  );
 });
