@@ -280,6 +280,14 @@ export function claimNextJob(db: DatabaseSync, sessionKey: string): Job | undefi
   return { ...job, state: "running" };
 }
 
+export function runningJobs(db: DatabaseSync): Job[] {
+  return db.prepare("SELECT * FROM jobs WHERE state = 'running' ORDER BY id ASC").all() as unknown as Job[];
+}
+
+export function queuedJobCount(db: DatabaseSync): number {
+  return Number((db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE state = 'queued'").get() as { n: number }).n);
+}
+
 export function queuedSessionKeys(db: DatabaseSync): string[] {
   const rows = db.prepare("SELECT DISTINCT session_key FROM jobs WHERE state = 'queued'").all() as Array<{
     session_key: string;

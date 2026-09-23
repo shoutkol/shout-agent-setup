@@ -103,6 +103,14 @@ otherwise). All JSON.
 | `GET` | `/tasks/{wo}` | — | 200 `{ session, queue, last_output }`, or 404 |
 | `DELETE` | `/tasks/{wo}` | — | 202 `{ closed: true }`, or 404 |
 | `GET` | `/sessions` | — | 200, list of open sessions |
+| `GET` | `/admin/health` | — | 200 `{ commit, uptime_s, running_jobs, queued_jobs, orca }` (`orca` is `"ok"` or the error from `orca repo list`) |
+| `GET` | `/admin/logs?lines=N` | — | 200 text: the last N (default 200, max 2000) lines of `journalctl --user -u orca-wrapper` |
+| `POST` | `/admin/deploy` | `{ force? }` | 202 `{ from, to, restarting: true }` after `git pull --ff-only origin main`; 409 `{ running }` if a job is running and `force` isn't `true`; 500 if the pull fails (no restart) |
+| `POST` | `/admin/restart` | `{ force? }` | 202 `{ restarting: true }`; 409 as above |
+
+`/admin/deploy` and `/admin/restart` answer, then exit with code 75; the unit's
+`Restart=on-failure` brings the service back ~5 s later. A restart fails any running job
+(`wrapper restarted`), which is why both refuse while one runs unless `force` is `true`.
 
 `body` on `/pr/{n}/prompt` must start with `/orca` (the GitHub Actions workflow filters this too,
 but the server re-checks — see `parseCommand` in `src/logic.ts`). Unknown routes are 404. Every

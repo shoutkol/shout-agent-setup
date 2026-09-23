@@ -6,6 +6,7 @@ import { config } from "./config.ts";
 import { openDb, getSessionByPr, getSession, getQueue, getLastOutput, listOpenSessions, taskKey } from "./db.ts";
 import { createWorker } from "./worker.ts";
 import { parseCommand, branchFor, isNotionUrl } from "./logic.ts";
+import * as admin from "./admin.ts";
 
 const WORKER_TICK_MS = 10_000;
 const IDLE_SWEEP_MS = 60 * 60 * 1000;
@@ -45,9 +46,16 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-export function startServer() {
+// `exit` is injectable so tests can exercise the restart routes without killing the test runner.
+export function startServer(options: { exit?: (code: number) => void } = {}) {
+  const exit = options.exit ?? ((code: number) => process.exit(code));
   const db = openDb(config.dbPath); // also runs the "running job -> failed" startup recovery
   const worker = createWorker(db);
+
+  // Answer first, then exit once the response has gone out — systemd restarts us (see admin.ts).
+  function restartAfter(res: ServerResponse): void {
+    res.on("finish", () => setTimeout(() => exit(admin.RESTART_EXIT_CODE), 200));
+  }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<number> {
     if (!isAuthorized(req)) {
@@ -191,6 +199,47 @@ export function startServer() {
       return 202;
     }
 
+    if (method === "GET" && url.pathname === "/admin/health") {
+      send(res, 200, await admin.health(db));
+      return 200;
+    }
+
+    if (method === "GET" && url.pathname === "/admin/logs") {
+      try {
+        const text = await admin.logs(Number(url.searchParams.get("lines") ?? 200));
+        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end(text);
+        return 200;
+      } catch (err: any) {
+        send(res, 500, { error: `journalctl failed: ${err?.message ?? err}` });
+        return 500;
+      }
+    }
+
+    if (method === "POST" && (url.pathname === "/admin/deploy" || url.pathname === "/admin/restart")) {
+      const body = await readJson(req);
+      const check = admin.canRestart(db, body?.force === true);
+      if (!check.ok) {
+        send(res, 409, { error: "jobs are running; retry later or send {\"force\":true}", running: check.running });
+        return 409;
+      }
+      if (url.pathname === "/admin/restart") {
+        restartAfter(res);
+        send(res, 202, { restarting: true });
+        return 202;
+      }
+      let pulled: { from: string; to: string };
+      try {
+        pulled = await admin.pullMain();
+      } catch (err: any) {
+        send(res, 500, { error: `git pull failed, not restarting: ${String(err?.stderr ?? err?.message ?? err).trim()}` });
+        return 500;
+      }
+      restartAfter(res);
+      send(res, 202, { ...pulled, restarting: true });
+      return 202;
+    }
+
     if (method === "GET" && url.pathname === "/sessions") {
       send(res, 200, listOpenSessions(db));
       return 200;
@@ -227,7 +276,7 @@ export function startServer() {
     db.close();
   }
 
-  return { server, close };
+  return { server, close, db };
 }
 
 const isEntryPoint = process.argv[1] !== undefined && import.meta.url === `file://${process.argv[1]}`;
