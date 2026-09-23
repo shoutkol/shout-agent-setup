@@ -119,6 +119,12 @@ export async function terminalWaitExit(handle: string, ms: number): Promise<bool
   }
 }
 
+// Accumulated output lines (escape sequences stripped). Orca keeps only ~32 KB per terminal.
+export async function terminalRead(handle: string, limit: number): Promise<string[]> {
+  const result = await run(["terminal", "read", "--terminal", handle, "--limit", String(limit)]);
+  return result.terminal?.tail ?? [];
+}
+
 export async function terminalClose(handle: string): Promise<void> {
   await run(["terminal", "close", "--terminal", handle]);
 }

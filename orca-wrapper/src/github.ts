@@ -152,3 +152,22 @@ export async function reopenPullRequest(pr: number): Promise<void> {
     throw new Error(`github reopen PR #${pr} failed: ${res.status} ${snippet}`);
   }
 }
+
+// Secret gist holding a full answer too long for one comment. Needs the token's `gist` scope
+// (gh's default login has it); the caller falls back to several comments if this throws.
+export async function createGist(filename: string, content: string, description: string): Promise<string> {
+  if (config.githubDryRun) {
+    console.log(`[dry-run] POST /gists ${filename} (${content.length} chars)`);
+    return "https://gist.example.invalid/dry-run";
+  }
+  const res = await fetch(`${API}/gists`, {
+    method: "POST",
+    headers: { ...authHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ description, public: false, files: { [filename]: { content } } }),
+  });
+  if (!res.ok) {
+    const snippet = (await res.text()).slice(0, 300);
+    throw new Error(`github create gist failed: ${res.status} ${snippet}`);
+  }
+  return ((await res.json()) as { html_url: string }).html_url;
+}

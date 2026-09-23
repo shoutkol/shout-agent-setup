@@ -86,6 +86,16 @@ properties) so that stripping is a no-op transform, not a compile.
    then separately lists and closes every terminal in the worktree, then removes the worktree —
    each step logged and attempted independently so one failure doesn't skip the rest.
 
+## Long answers
+
+Orca's run snapshot stops at ~8 KB, with no truncation flag. When a snapshot is that long, the
+worker runs a one-line command in the session's worktree that prints the agent's final message
+from its Claude transcript (`~/.claude/projects/<cwd>/`), gzipped and base64'd, and reads it
+back with `orca terminal read` (which keeps ~32 KB — about 80–100 KB of prose). It's used only if
+it starts the way the snapshot does; otherwise the snapshot is posted with a warning. An answer
+over 60,000 chars (GitHub's comment limit is 65,536) posts its first part plus a secret gist with
+the full text, or several `(part i/n)` comments if the token can't create gists.
+
 ## Images in comments
 
 Pasted images arrive as `https://github.com/user-attachments/assets/<uuid>` links that 404 without

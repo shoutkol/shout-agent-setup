@@ -11,6 +11,7 @@ import * as github from "./github.ts";
 import { isDone, isLaunchFrame, launchMarker, stable, renderPrompt, shq } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
+import { COMMENT_MAX_CHARS, decodeAnswer, extractCommand, looksCapped, matchesSnapshot, splitText } from "./answer.ts";
 
 const POLL_MS = 5_000;
 const BRANCH_POLL_MS = 3_000;
@@ -144,6 +145,11 @@ export function createWorker(handle: DatabaseSync) {
       // too short to be told apart from an answer (see logic.launchMarker).
       const marker = session.kind === "pr" || job.comment_id != null ? PREAMBLE_MARKER : launchMarker(prompt);
       const result = await waitForCompletion(session, runId, marker);
+      if (result.outcome === "done" && looksCapped(result.content, result.truncated)) {
+        const full = await recoverFullAnswer(session, result.content);
+        if (full) Object.assign(result, { content: full, truncated: false });
+        else Object.assign(result, { truncated: true });
+      }
       if (result.outcome === "done") {
         db.markJobDone(handle, job.id, result.content);
         db.touchSession(handle, session.key);
@@ -389,13 +395,54 @@ export function createWorker(handle: DatabaseSync) {
     return { outcome: "error", reason: `timed out after ${config.runTimeoutMin} minutes` };
   }
 
+  // A snapshot at Orca's cap: read the agent's final message from its Claude transcript on the
+  // agent host instead (see answer.ts). Null if that fails or doesn't match what Orca showed —
+  // the caller then posts the snapshot with a warning.
+  async function recoverFullAnswer(session: db.Session, snapshot: string): Promise<string | null> {
+    let h: string | undefined;
+    try {
+      h = await orca.terminalCreate(session.worktree_id!, "answer", extractCommand());
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        await sleep(1_000);
+        const full = decodeAnswer(await orca.terminalRead(h, 2_000));
+        if (full !== null) return full.length > snapshot.length && matchesSnapshot(full, snapshot) ? full : null;
+      }
+      console.log(`answer recovery timed out key=${session.key}`);
+      return null;
+    } catch (err) {
+      console.log(`answer recovery failed key=${session.key}: ${err}`);
+      return null;
+    } finally {
+      if (h) await orca.terminalClose(h).catch((err) => console.log(`answer terminalClose failed key=${session.key}: ${err}`));
+    }
+  }
+
   // `who` is "@login" for PR jobs (the commenter's GitHub login) but a plain name for task jobs:
   // that author comes from n8n/Notion, and @-mentioning it would ping whoever owns that handle.
+  // Output goes inline, not folded: readers wanted the answer visible without a click. An answer
+  // too long for one comment (GitHub rejects > 65,536 chars) posts its first part and links the
+  // full text in a secret gist — or, if no gist can be made, continues over several comments.
   async function postResult(pr: number, who: string, content: string, truncated: boolean): Promise<void> {
-    const truncatedNote = truncated ? "\n\n⚠️ output truncated by Orca" : "";
-    // Output goes inline, not folded: readers wanted the answer visible without a click.
-    const body = `🐳 orca: done for ${who}'s request\n\n${content}${truncatedNote}`;
-    await github.comment(pr, body);
+    const header = `🐳 orca: done for ${who}'s request\n\n`;
+    const truncatedNote = truncated
+      ? "\n\n⚠️ Orca cut this answer off at ~8 KB and the full text couldn't be recovered from the agent's transcript."
+      : "";
+    if (content.length <= COMMENT_MAX_CHARS) {
+      await github.comment(pr, header + content + truncatedNote);
+      return;
+    }
+    const parts = splitText(content);
+    try {
+      const url = await github.createGist(`pr-${pr}-answer.md`, content, `orca answer on shoutkol/shout#${pr}`);
+      await github.comment(pr, `${header}${parts[0]}\n\n…\n\n📄 The full answer (${content.length.toLocaleString("en")} chars) is too long for a comment: ${url}${truncatedNote}`);
+    } catch (err) {
+      console.log(`gist failed pr=${pr}, posting ${parts.length} comments instead: ${err}`);
+      for (const [i, part] of parts.entries()) {
+        const last = i === parts.length - 1;
+        await github.comment(pr, `${i === 0 ? header : "🐳 orca: (continued)\n\n"}${part}\n\n(part ${i + 1}/${parts.length})${last ? truncatedNote : ""}`);
+      }
+    }
   }
 
   async function postFailure(pr: number, reason: string): Promise<void> {
@@ -438,7 +485,9 @@ export function createWorker(handle: DatabaseSync) {
       db.updateSession(handle, session.key, { pr: pr.number, head_ref: branch });
       await postResult(pr.number, job.author, content, truncated);
     } else {
-      const body = `Notion: ${session.notion_url}\n\n${content}`;
+      // A PR body has the same 65,536-char limit as a comment.
+      const answer = content.length <= COMMENT_MAX_CHARS ? content : `${splitText(content)[0]}\n\n…(answer truncated for the PR body)`;
+      const body = `Notion: ${session.notion_url}\n\n${answer}`;
       pr = await github.createPullRequest({ title: `WO-${session.wo}: ${session.title}`, head: branch, base: "dev", body });
       db.updateSession(handle, session.key, { pr: pr.number, head_ref: branch });
     }
