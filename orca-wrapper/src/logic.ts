@@ -86,13 +86,31 @@ export function stable(capturedAts: ReadonlyArray<string | null>): string | unde
 //     "> " quote). An answer that quotes our preamble somewhere in the middle is still an answer.
 //   - a capture that ends on a shell prompt: `user@host:path$` or a prompt ending " $". Not any
 //     trailing `$` — "ราคา 5$" is an answer.
+//   - a raw Claude Code TUI screen instead of the clean final message: its status bar ("esc to
+//     interrupt", "⏵⏵ bypass permissions"), a prompt line ("❯ …"), or a spinner/status line
+//     ("✽ Cooking…", "✻ Brewed for 17s"). Seen live on PR 492: Orca reported completed + idle
+//     while the agent was still in its Stop hook, and the capture was the whole screen, old
+//     answers included.
 export function isLaunchFrame(content: string, marker: string): boolean {
   const c = content.trim();
   if (c === "") return true;
+  if (isTuiScreen(c)) return true;
   if (/claude\s+'--dangerously-skip-permissions'/.test(c)) return true;
   if (marker && c.replace(/^>\s*/, "").startsWith(marker)) return true;
   const lastLine = c.split("\n").pop()!.trim();
   return /^[\w.-]+@[\w.-]+:\S*[$#]$/.test(lastLine) || /(^|\s)\$$/.test(lastLine);
+}
+
+const TUI_CHROME = [
+  /esc to interrupt/,
+  /⏵⏵ bypass permissions/,
+  /^\s*❯(\s|$)/m,
+  /^\s*[✻✽✶✳✢·*]\s+\S+…/m, // spinner: "✽ Cooking… (running Stop hook · 8s)"
+  /^\s*✻\s+\S+ for \d+s/m, // status: "✻ Brewed for 17s · done 9:10 AM"
+];
+
+export function isTuiScreen(content: string): boolean {
+  return TUI_CHROME.some((re) => re.test(content));
 }
 
 // Marker for a task prompt's echo: its first 40 chars — but only when there are 40. A shorter
