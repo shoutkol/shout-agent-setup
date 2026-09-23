@@ -3,9 +3,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { timingSafeEqual } from "node:crypto";
 import { URL } from "node:url";
 import { config } from "./config.ts";
-import { openDb, getSessionByPr, getSession, getQueue, getLastOutput, listOpenSessions, taskKey } from "./db.ts";
+import { openDb, getSessionByPr, getSession, getQueue, getLastOutput, listOpenSessions, taskKey, markRunningJobsFailed } from "./db.ts";
 import { createWorker } from "./worker.ts";
-import { parseCommand, branchFor, isNotionUrl } from "./logic.ts";
+import { parseCommand, branchFor, isNotionUrl, isSafeRef, USAGE } from "./logic.ts";
+import * as github from "./github.ts";
 import * as admin from "./admin.ts";
 
 const WORKER_TICK_MS = 10_000;
@@ -25,6 +26,9 @@ function isAuthorized(req: IncomingMessage): boolean {
   return timingSafeEqual(provided, expected);
 }
 
+// A body that isn't JSON is the caller's mistake (400), not ours (500).
+class InvalidJson extends Error {}
+
 function readJson(req: IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -33,8 +37,8 @@ function readJson(req: IncomingMessage): Promise<any> {
       if (chunks.length === 0) return resolve({});
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      } catch (err) {
-        reject(err);
+      } catch (err: any) {
+        reject(new InvalidJson(err?.message ?? "invalid JSON"));
       }
     });
     req.on("error", reject);
@@ -49,8 +53,14 @@ function send(res: ServerResponse, status: number, body: unknown): void {
 // `exit` is injectable so tests can exercise the restart routes without killing the test runner.
 export function startServer(options: { exit?: (code: number) => void } = {}) {
   const exit = options.exit ?? ((code: number) => process.exit(code));
-  const db = openDb(config.dbPath); // also runs the "running job -> failed" startup recovery
+  const db = openDb(config.dbPath);
   const worker = createWorker(db);
+  // Startup recovery: jobs left "running" by the last process are failed (never resent) and each
+  // PR is told. Fire-and-forget — the notices must not hold up listening.
+  const interrupted = markRunningJobsFailed(db);
+  if (interrupted.length > 0) {
+    void worker.notifyInterrupted(interrupted).catch((err) => console.log(`restart notices failed: ${err}`));
+  }
 
   // Answer first, then exit once the response has gone out — systemd restarts us (see admin.ts).
   function restartAfter(res: ServerResponse): void {
@@ -96,18 +106,43 @@ export function startServer(options: { exit?: (code: number) => void } = {}) {
         send(res, 400, { error: "not an /orca command" });
         return 400;
       }
+      if (!isSafeRef(headRef)) {
+        await github.comment(pr, `🐳 orca: can't work on this PR — its branch name \`${JSON.stringify(headRef)}\` has characters the wrapper won't pass to a shell. Rename the branch to letters, digits, \`.\`, \`_\`, \`-\` and \`/\`.`);
+        send(res, 400, { error: "unsupported head_ref" });
+        return 400;
+      }
+      if (cmd.type === "help") {
+        await github.comment(pr, USAGE);
+        send(res, 202, { help: true });
+        return 202;
+      }
       if (cmd.type === "stop") {
         // Session may not exist under key `pr-<n>` — it could be a task session whose PR this is.
         // getSessionByPr finds either; when there's truly nothing to close, closeSession no-ops
         // safely on the fallback key. Always 202: an /orca stop comment on a PR with no live
         // session isn't an error from the commenter's point of view.
         const session = getSessionByPr(db, pr);
-        await worker.closeSession(session?.key ?? `pr-${pr}`);
+        const result = await worker.closeSession(session?.key ?? `pr-${pr}`);
+        if (result === "closing") {
+          await github.comment(pr, "🐳 orca: stopping — the request in progress will finish and post its answer first, then this session closes.");
+          send(res, 202, { closing: true });
+          return 202;
+        }
         send(res, 202, { closed: true });
         return 202;
       }
-      const { jobId, position } = worker.enqueuePrJob(pr, headRef, commentId, author, cmd.prompt);
-      send(res, 202, { job_id: jobId, position });
+      if ((await github.pullState(pr)) === "closed") {
+        await github.comment(pr, `🐳 orca: PR #${pr} is closed, so there's no session to run this in. Reopen the PR to use /orca again.`);
+        send(res, 202, { pr_closed: true });
+        return 202;
+      }
+      const queued = worker.enqueuePrJob(pr, headRef, commentId, author, cmd.prompt);
+      if ("rejected" in queued) {
+        await github.comment(pr, "🐳 orca: this PR's session is stopping, so this request wasn't queued. Send it again once the current answer is posted.");
+        send(res, 202, { rejected: queued.rejected });
+        return 202;
+      }
+      send(res, 202, { job_id: queued.jobId, position: queued.position, ...(queued.deduped ? { deduped: true } : {}) });
       return 202;
     }
 
@@ -167,13 +202,21 @@ export function startServer(options: { exit?: (code: number) => void } = {}) {
         } catch {
           rawRepoApp = [rawRepoApp];
         }
+        if (typeof rawRepoApp === "string") rawRepoApp = [rawRepoApp]; // '"shout-web"' — a JSON string, not a list
       }
       const repoApp: string[] = Array.isArray(rawRepoApp) ? rawRepoApp.filter((x: unknown) => typeof x === "string") : [];
 
       const branch = branchFor(wo, title);
       const repoAppLine = repoApp.length > 0 ? repoApp.join(", ") : null;
-      const { key, jobId, position } = worker.enqueueTask(wo, notionUrl, title, author, branch, repoAppLine, prompt);
-      send(res, 202, { key, job_id: jobId, position });
+      // Always a 2xx, even for a duplicate or a closing session: n8n only moves the row to
+      // Building on success, and both of those mean the work order is already being handled.
+      const queued = worker.enqueueTask(wo, notionUrl, title, author, branch, repoAppLine, prompt);
+      if ("rejected" in queued) {
+        console.log(`task ${queued.key}: POST /tasks while the session is ${queued.rejected}, not queued`);
+        send(res, 202, { key: queued.key, rejected: queued.rejected });
+        return 202;
+      }
+      send(res, 202, { key: queued.key, job_id: queued.jobId, position: queued.position, ...(queued.deduped ? { deduped: true } : {}) });
       return 202;
     }
 
@@ -255,6 +298,10 @@ export function startServer(options: { exit?: (code: number) => void } = {}) {
     const path = req.url ?? "/";
     handle(req, res)
       .catch((err) => {
+        if (err instanceof InvalidJson) {
+          if (!res.headersSent) send(res, 400, { error: "invalid JSON body" });
+          return 400;
+        }
         console.log(`unhandled error on ${method} ${path}: ${err?.stack ?? err}`);
         if (!res.headersSent) send(res, 500, { error: "internal error" });
         return 500;

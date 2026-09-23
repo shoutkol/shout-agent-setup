@@ -110,3 +110,82 @@ test("POST /tasks: n8n-style stringy fields (wo \"73\", repo_app as a JSON strin
     close();
   }
 });
+
+async function post(base: string, path: string, raw: string): Promise<Response> {
+  return fetch(`${base}${path}`, {
+    method: "POST",
+    headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+    body: raw,
+  });
+}
+
+test("a body that isn't JSON is a 400 on both POST routes, not a 500", async () => {
+  const { server, close } = startServer();
+  await new Promise<void>((resolve) => server.on("listening", () => resolve()));
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  try {
+    for (const path of ["/tasks", "/pr/5/prompt"]) {
+      const res = await post(base, path, "{not json");
+      assert.strictEqual(res.status, 400, path);
+      assert.deepStrictEqual(await res.json(), { error: "invalid JSON body" });
+    }
+  } finally {
+    close();
+  }
+});
+
+test("POST /tasks: repo_app sent as a single JSON string ('\"shout-web\"') is kept, not dropped", async () => {
+  const { server, close, db } = startServer();
+  await new Promise<void>((resolve) => server.on("listening", () => resolve()));
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  try {
+    const res = await post(
+      base,
+      "/tasks",
+      JSON.stringify({ notion_url: "https://app.notion.com/p/abc", wo: 91, title: "T", repo_app: '"shout-web"', prompt: "go" }),
+    );
+    assert.strictEqual(res.status, 202);
+    const row = db.prepare("SELECT repo_app FROM sessions WHERE key = 'wo-91'").get() as { repo_app: string };
+    assert.strictEqual(row.repo_app, "shout-web");
+  } finally {
+    close();
+  }
+});
+
+test("POST /pr/{n}/prompt: bare /orca -> 202 help; an unsafe head_ref -> 400 and nothing queued", async () => {
+  const { server, close, db } = startServer();
+  await new Promise<void>((resolve) => server.on("listening", () => resolve()));
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const comment = (body: string, head_ref = "feat/x") =>
+    JSON.stringify({ head_ref, base_ref: "dev", comment_id: 1, body, author: "alice" });
+  try {
+    const help = await post(base, "/pr/6/prompt", comment("/orca"));
+    assert.strictEqual(help.status, 202);
+    assert.deepStrictEqual(await help.json(), { help: true });
+
+    const unsafe = await post(base, "/pr/6/prompt", comment("/orca hi", "t;touch${IFS}/tmp/pwned"));
+    assert.strictEqual(unsafe.status, 400);
+    const jobs = db.prepare("SELECT COUNT(*) AS n FROM jobs").get() as { n: number };
+    assert.strictEqual(jobs.n, 0);
+  } finally {
+    close();
+  }
+});
+
+test("POST /pr/{n}/prompt: the same comment delivered twice (workflow re-run) is one job", async () => {
+  const { server, close, db } = startServer();
+  await new Promise<void>((resolve) => server.on("listening", () => resolve()));
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const body = JSON.stringify({ head_ref: "feat/x", base_ref: "dev", comment_id: 4242, body: "/orca hi", author: "alice" });
+  try {
+    const first = (await (await post(base, "/pr/9/prompt", body)).json()) as { job_id: number; deduped?: boolean };
+    const second = (await (await post(base, "/pr/9/prompt", body)).json()) as { job_id: number; deduped?: boolean };
+    assert.strictEqual(second.job_id, first.job_id);
+    assert.strictEqual(second.deduped, true);
+    assert.strictEqual(first.deduped, undefined);
+    const n = (db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE comment_id = 4242").get() as { n: number }).n;
+    assert.strictEqual(n, 1);
+  } finally {
+    close();
+  }
+});

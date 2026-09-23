@@ -34,6 +34,7 @@ Read once at startup in `src/config.ts`.
 | `DB_PATH` | no | `${HOME}/.local/share/orca-wrapper/state.sqlite` | SQLite file (dir is created if missing). |
 | `IDLE_DAYS` | no | `15` | Sessions idle this long are closed by the hourly sweep. |
 | `RUN_TIMEOUT_MIN` | no | `60` | Max time to wait for one automation run to finish. |
+| `BUSY_WAIT_MIN` | no | `10` | Before a session's next run, max time to wait for its agent terminal to go idle (a timed-out or pre-restart run may still be going). Past it, the job fails with a note instead of running on top. |
 
 On startup `openDb` adds any nullable column the current schema has but the deployed database
 lacks (e.g. `sessions.prompt_template`), so a plain update keeps existing sessions. The one change
@@ -96,7 +97,7 @@ otherwise). All JSON.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `POST` | `/pr/{n}/prompt` | `{ head_ref, base_ref, comment_id, body, author }` | 202 `{ job_id, position }`, or 202 `{ closed: true }` if `body` is `/orca stop` |
+| `POST` | `/pr/{n}/prompt` | `{ head_ref, base_ref, comment_id, body, author }` | 202 `{ job_id, position }`; 202 `{ closed: true }` for a stop; 202 `{ help: true }` for a bare `/orca` (usage posted to the PR); 202 `{ pr_closed: true }` if the PR is closed (a note is posted, nothing runs); 400 if `head_ref` isn't a plain branch name |
 | `GET` | `/pr/{n}` | — | 200 `{ session, queue, last_output }`, or 404 |
 | `DELETE` | `/pr/{n}` | — | 202 `{ closed: true }`, or 404 |
 | `POST` | `/tasks` | `{ notion_url, wo, title, prompt, author?, repo_app? }` | 202 `{ key, job_id, position }` |
@@ -113,7 +114,10 @@ otherwise). All JSON.
 (`wrapper restarted`), which is why both refuse while one runs unless `force` is `true`.
 
 `body` on `/pr/{n}/prompt` must start with `/orca` (the GitHub Actions workflow filters this too,
-but the server re-checks — see `parseCommand` in `src/logic.ts`). Unknown routes are 404. Every
+but the server re-checks — see `parseCommand` in `src/logic.ts`). `stop`, `stop.`, `Stop!`,
+`stop please` and `please stop` all stop; a longer sentence starting with "stop" is a prompt.
+`position` counts the job already running, so 1 means "runs next (or now)". A body that isn't
+JSON is a 400. Unknown routes are 404. Every
 request logs one line to stdout: method, path, status, duration.
 
 ## Tasks (Notion work orders)

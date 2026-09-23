@@ -1,4 +1,4 @@
-// GitHub REST calls, via global fetch — just the two endpoints the wrapper needs.
+// GitHub REST calls, via global fetch — just the endpoints the wrapper needs.
 import { config } from "./config.ts";
 
 const API = "https://api.github.com";
@@ -96,4 +96,20 @@ export async function createPullRequest(params: {
   }
   const json = (await res.json()) as { number: number; html_url: string };
   return { number: json.number, html_url: json.html_url };
+}
+
+// Checked before queueing a prompt: a closed PR's close event has already fired, so a session
+// opened for it now would never be torn down. Dry-run pretends every PR is open.
+export async function pullState(pr: number): Promise<"open" | "closed"> {
+  if (config.githubDryRun) {
+    console.log(`[dry-run] GET /repos/${config.githubRepo}/pulls/${pr}`);
+    return "open";
+  }
+  const res = await fetch(`${API}/repos/${config.githubRepo}/pulls/${pr}`, { headers: authHeaders() });
+  if (!res.ok) {
+    const snippet = (await res.text()).slice(0, 500);
+    throw new Error(`github get PR #${pr} failed: ${res.status} ${snippet}`);
+  }
+  const body = (await res.json()) as { state: string };
+  return body.state === "closed" ? "closed" : "open";
 }

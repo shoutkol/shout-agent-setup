@@ -61,3 +61,11 @@ test("renderPrompt: an unrecognised placeholder is left untouched, not blanked",
 test("renderPrompt: a template with no placeholders is returned unchanged", () => {
   assert.strictEqual(renderPrompt("Just read the ticket and go.", {}), "Just read the ticket and go.");
 });
+
+test("renderPrompt: placeholders only match the vars' own keys, never Object.prototype's", () => {
+  const vars = { branch: "b", wo: "1", title: "t", notion_url: "n", repo_app: "" };
+  assert.strictEqual(
+    renderPrompt("{{constructor}} {{toString}} {{hasOwnProperty}} {{__proto__}}", vars),
+    "{{constructor}} {{toString}} {{hasOwnProperty}} {{__proto__}}",
+  );
+});
