@@ -11,6 +11,7 @@ import * as github from "./github.ts";
 import { isDone, isLaunchFrame, launchMarker, stable, renderPrompt, shq } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
+import { COMMENT_MAX_CHARS, decodeAnswer, extractCommand, looksCapped, matchesSnapshot, splitText } from "./answer.ts";
 
 const POLL_MS = 5_000;
 const BRANCH_POLL_MS = 3_000;
@@ -142,8 +143,13 @@ export function createWorker(handle: DatabaseSync) {
       // the terminal echoing it back. A task's prompt is Notion-authored and varies per session (and
       // per follow-up), so its own first 40 chars are the marker instead — or none, for a prompt
       // too short to be told apart from an answer (see logic.launchMarker).
-      const marker = session.kind === "pr" ? PREAMBLE_MARKER : launchMarker(prompt);
+      const marker = session.kind === "pr" || job.comment_id != null ? PREAMBLE_MARKER : launchMarker(prompt);
       const result = await waitForCompletion(session, runId, marker);
+      if (result.outcome === "done" && looksCapped(result.content, result.truncated)) {
+        const full = await recoverFullAnswer(session, result.content);
+        if (full) Object.assign(result, { content: full, truncated: false });
+        else Object.assign(result, { truncated: true });
+      }
       if (result.outcome === "done") {
         db.markJobDone(handle, job.id, result.content);
         db.touchSession(handle, session.key);
@@ -208,40 +214,56 @@ export function createWorker(handle: DatabaseSync) {
     // worktree branch on origin/<head>, which is guaranteed to exist afterwards.
     await runInWorktree(await baseWorktreeRef(), "fetch", `git fetch origin ${shq(headRef)}; exit`, session.key);
     const worktreeId = await orca.worktreeCreate(session.key, `origin/${headRef}`);
-    db.updateSession(handle, session.key, { worktree_id: worktreeId });
 
-    // worktreeCreate always creates a NEW branch at the base commit — it never checks out headRef
-    // itself. `git checkout <head>` here creates the local tracking branch from origin/<head>.
-    // We poll `worktree list` until Orca's own branch field flips to confirm the checkout landed.
-    const checkoutCmd = `git fetch origin ${shq(headRef)} && git checkout ${shq(headRef)} && git branch --set-upstream-to=${shq(`origin/${headRef}`)}; exit`;
-    const checkoutHandle = await orca.terminalCreate(worktreeId, "checkout", checkoutCmd);
-    try {
-      await pollUntilCheckedOut(worktreeId, headRef);
-    } finally {
-      await orca.terminalClose(checkoutHandle).catch((err) => console.log(`checkout terminalClose failed key=${session.key}: ${err}`));
-    }
+    // Put the worktree on a local branch of our own that tracks origin/<head>, rather than on
+    // <head> itself: git refuses to check out a branch that another worktree of the same clone
+    // already has, and on the agent host other sessions routinely do (seen live on PR 492). The
+    // agent pulls from the upstream and pushes with HEAD:<head> (see preamble.ts).
+    const local = localBranchFor(session);
+    const origin = `origin/${headRef}`;
+    const checkoutCmd = `git fetch origin ${shq(headRef)} && git checkout -B ${shq(local)} ${shq(origin)} && git branch --set-upstream-to=${shq(origin)}; exit`;
+    await checkOutOrDiscard(session, worktreeId, checkoutCmd, local, `PR branch ${headRef}`);
   }
 
   async function ensureTaskWorktree(session: db.Session): Promise<void> {
     const branch = session.head_ref!; // the WO's own branch, e.g. claude/WO-12-campaign-owner-credit
     await runInWorktree(await baseWorktreeRef(), "fetch", `git fetch origin dev; exit`, session.key);
     // `--name` is only a hint: Orca sanitises slashes and may add a user prefix (e.g. turns this
-    // into `ziveso/claude-WO-12-x`), so its own branch is never the one we want — same reasoning
-    // as the PR checkout dance below, just with a branch we create ourselves instead of one that
-    // already exists on origin.
+    // into `ziveso/claude-WO-12-x`), so its own branch is never the one we want.
     const worktreeId = await orca.worktreeCreate(branch, "origin/dev");
-    db.updateSession(handle, session.key, { worktree_id: worktreeId });
 
-    // Force-create our own branch off origin/dev and push it immediately — before the agent ever
-    // runs. This guarantees the branch exists on origin so the wrapper can always open a PR later
-    // even if the agent gets nothing done, and gives the agent an upstream to push to.
-    const checkoutCmd = `git checkout -B ${shq(branch)} origin/dev && git push -u origin ${shq(branch)}; exit`;
-    const checkoutHandle = await orca.terminalCreate(worktreeId, "checkout", checkoutCmd);
+    // One work order, one branch, one PR: when the branch is already on origin (the WO was
+    // dispatched before), carry on from it; otherwise create it off origin/dev and push it right
+    // away, before the agent runs, so the wrapper can always open a PR later and the agent has an
+    // upstream to push to. Never reset an existing branch back to dev.
+    const b = shq(branch);
+    const ob = shq(`origin/${branch}`);
+    const checkoutCmd =
+      `if git fetch origin ${b}; then git checkout -B ${b} ${ob} && git branch --set-upstream-to=${ob}; ` +
+      `else git checkout -B ${b} origin/dev && git push -u origin ${b}; fi; exit`;
+    await checkOutOrDiscard(session, worktreeId, checkoutCmd, branch, `work order branch ${branch}`);
+  }
+
+  // Runs the checkout in the new worktree and waits for Orca to report `branch`. The worktree is
+  // only recorded on the session once that lands: recording it first meant a failed checkout was
+  // never retried — the next job skipped ensureWorktree and ran on Orca's own branch (H-15).
+  async function checkOutOrDiscard(session: db.Session, worktreeId: string, command: string, branch: string, what: string): Promise<void> {
+    const checkoutHandle = await orca.terminalCreate(worktreeId, "checkout", command);
     try {
       await pollUntilCheckedOut(worktreeId, branch);
+    } catch (err: any) {
+      await orca.worktreeRm(worktreeId).catch((e) => console.log(`discarding worktree failed key=${session.key}: ${e}`));
+      throw new Error(`couldn't check out the ${what} in a fresh worktree (${err?.message ?? err}). Is it still on origin?`);
     } finally {
       await orca.terminalClose(checkoutHandle).catch((err) => console.log(`checkout terminalClose failed key=${session.key}: ${err}`));
     }
+    db.updateSession(handle, session.key, { worktree_id: worktreeId });
+  }
+
+  // Per session, not per PR: a leftover worktree from an earlier session of the same PR may still
+  // hold orca/pr-<n>, and a name that's taken is exactly the collision this avoids.
+  function localBranchFor(session: db.Session): string {
+    return `orca/pr-${session.pr}-${session.created_at.toString(36)}`;
   }
 
   // One-shot shell command in a worktree, waited on until its shell exits (the command must end
@@ -297,7 +319,10 @@ export function createWorker(handle: DatabaseSync) {
   // the session's values, except the auto-generated Notion-writeback job, which is sent exactly as
   // stored (see NOTION_UPDATE_KIND in handleCompletion).
   async function buildPrompt(session: db.Session, job: db.Job, worktreeId: string): Promise<string> {
-    if (session.kind === "pr") {
+    // Any job that came from a PR comment — including an /orca comment on a work order's PR — gets
+    // the PR preamble and its images staged. Without it an /orca on a WO-PR reached the agent as
+    // bare comment text: no pull first, no "don't open PRs", no images (H-05).
+    if (session.kind === "pr" || (job.comment_id != null && session.pr)) {
       return preamble(session.head_ref!, session.pr!) + "\n\n" + (await stageAttachments(job, worktreeId, session.pr!));
     }
     if (job.kind === NOTION_UPDATE_KIND) return job.prompt;
@@ -370,13 +395,54 @@ export function createWorker(handle: DatabaseSync) {
     return { outcome: "error", reason: `timed out after ${config.runTimeoutMin} minutes` };
   }
 
+  // A snapshot at Orca's cap: read the agent's final message from its Claude transcript on the
+  // agent host instead (see answer.ts). Null if that fails or doesn't match what Orca showed —
+  // the caller then posts the snapshot with a warning.
+  async function recoverFullAnswer(session: db.Session, snapshot: string): Promise<string | null> {
+    let h: string | undefined;
+    try {
+      h = await orca.terminalCreate(session.worktree_id!, "answer", extractCommand());
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        await sleep(1_000);
+        const full = decodeAnswer(await orca.terminalRead(h, 2_000));
+        if (full !== null) return full.length > snapshot.length && matchesSnapshot(full, snapshot) ? full : null;
+      }
+      console.log(`answer recovery timed out key=${session.key}`);
+      return null;
+    } catch (err) {
+      console.log(`answer recovery failed key=${session.key}: ${err}`);
+      return null;
+    } finally {
+      if (h) await orca.terminalClose(h).catch((err) => console.log(`answer terminalClose failed key=${session.key}: ${err}`));
+    }
+  }
+
   // `who` is "@login" for PR jobs (the commenter's GitHub login) but a plain name for task jobs:
   // that author comes from n8n/Notion, and @-mentioning it would ping whoever owns that handle.
+  // Output goes inline, not folded: readers wanted the answer visible without a click. An answer
+  // too long for one comment (GitHub rejects > 65,536 chars) posts its first part and links the
+  // full text in a secret gist — or, if no gist can be made, continues over several comments.
   async function postResult(pr: number, who: string, content: string, truncated: boolean): Promise<void> {
-    const truncatedNote = truncated ? "\n\n⚠️ output truncated by Orca" : "";
-    // Output goes inline, not folded: readers wanted the answer visible without a click.
-    const body = `🐳 orca: done for ${who}'s request\n\n${content}${truncatedNote}`;
-    await github.comment(pr, body);
+    const header = `🐳 orca: done for ${who}'s request\n\n`;
+    const truncatedNote = truncated
+      ? "\n\n⚠️ Orca cut this answer off at ~8 KB and the full text couldn't be recovered from the agent's transcript."
+      : "";
+    if (content.length <= COMMENT_MAX_CHARS) {
+      await github.comment(pr, header + content + truncatedNote);
+      return;
+    }
+    const parts = splitText(content);
+    try {
+      const url = await github.createGist(`pr-${pr}-answer.md`, content, `orca answer on shoutkol/shout#${pr}`);
+      await github.comment(pr, `${header}${parts[0]}\n\n…\n\n📄 The full answer (${content.length.toLocaleString("en")} chars) is too long for a comment: ${url}${truncatedNote}`);
+    } catch (err) {
+      console.log(`gist failed pr=${pr}, posting ${parts.length} comments instead: ${err}`);
+      for (const [i, part] of parts.entries()) {
+        const last = i === parts.length - 1;
+        await github.comment(pr, `${i === 0 ? header : "🐳 orca: (continued)\n\n"}${part}\n\n(part ${i + 1}/${parts.length})${last ? truncatedNote : ""}`);
+      }
+    }
   }
 
   async function postFailure(pr: number, reason: string): Promise<void> {
@@ -408,9 +474,23 @@ export function createWorker(handle: DatabaseSync) {
       return;
     }
 
-    const body = `Notion: ${session.notion_url}\n\n${content}`;
-    const pr = await github.createPullRequest({ title: `WO-${session.wo}: ${session.title}`, head: branch, base: "dev", body });
-    db.updateSession(handle, session.key, { pr: pr.number, head_ref: branch });
+    // One work order, one PR. A re-dispatched WO (new session after the old one closed) finds the
+    // PR its branch already has: open → answer there; closed without merging → reopen it; merged →
+    // that work is done, so a new PR for the new commits.
+    const existing = await github.findPullByHead(branch);
+    let pr: { number: number; html_url: string };
+    if (existing && !existing.merged) {
+      if (existing.state === "closed") await github.reopenPullRequest(existing.number);
+      pr = existing;
+      db.updateSession(handle, session.key, { pr: pr.number, head_ref: branch });
+      await postResult(pr.number, job.author, content, truncated);
+    } else {
+      // A PR body has the same 65,536-char limit as a comment.
+      const answer = content.length <= COMMENT_MAX_CHARS ? content : `${splitText(content)[0]}\n\n…(answer truncated for the PR body)`;
+      const body = `Notion: ${session.notion_url}\n\n${answer}`;
+      pr = await github.createPullRequest({ title: `WO-${session.wo}: ${session.title}`, head: branch, base: "dev", body });
+      db.updateSession(handle, session.key, { pr: pr.number, head_ref: branch });
+    }
 
     const notionPrompt =
       `The pull request is open: ${pr.html_url} (#${pr.number}). Using your Notion tools, update the ` +
@@ -498,6 +578,13 @@ export function createWorker(handle: DatabaseSync) {
         console.log(`terminalList failed key=${session.key}: ${err}`);
       }
       await orca.worktreeRm(session.worktree_id).catch((err) => console.log(`worktreeRm failed key=${session.key}: ${err}`));
+      if (session.kind === "pr") {
+        // Our per-session branch (see localBranchFor) outlives the worktree otherwise.
+        const local = shq(localBranchFor(session));
+        await runInWorktree(await baseWorktreeRef(), "cleanup", `git branch -D ${local}; exit`, session.key).catch((err) =>
+          console.log(`branch cleanup failed key=${session.key}: ${err}`),
+        );
+      }
     }
     db.closeSessionRow(handle, session.key);
   }
