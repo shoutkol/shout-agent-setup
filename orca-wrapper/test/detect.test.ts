@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isDone, isLaunchFrame, launchMarker, stable } from "../src/logic.ts";
+import { readFileSync } from "node:fs";
 
 test("fresh session: early completed but not idle -> pending", () => {
   assert.strictEqual(isDone("completed", false), "pending");
@@ -85,4 +86,22 @@ test("launch frame: a short task prompt gives no marker, so answers containing i
   assert.strictEqual(isLaunchFrame('"token" หมายถึงเรื่องไหนครับ', launchMarker("token")), false);
   const long = "You are working in a git worktree checked out on branch `claude/WO-74-x`";
   assert.strictEqual(launchMarker(long), long.slice(0, 40));
+});
+
+test("launch frame: a raw TUI screen (PR 492, agent still in its Stop hook) is not an answer", () => {
+  const frame = readFileSync(new URL("./fixtures/tui-frame-pr492.txt", import.meta.url), "utf8");
+  assert.strictEqual(isLaunchFrame(frame, "You are working in a git worktree of shoutkol/shout"), true);
+  assert.strictEqual(isLaunchFrame(frame, ""), true); // even with no marker (short task prompt)
+});
+
+test("launch frame: answers using ordinary bullets, arrows or 'for 5s' still pass", () => {
+  for (const answer of [
+    "- item one\n- item two",
+    "* bold point\n* another",
+    "Timings: build ran for 17s, tests for 42s.",
+    "HEAD -> qa/orca-e2e-plain (75545a8d5..b46822f07)",
+    "สรุป:\n• แก้ 2 ไฟล์\n• push แล้ว",
+  ]) {
+    assert.strictEqual(isLaunchFrame(answer, MARKER), false, answer);
+  }
 });
