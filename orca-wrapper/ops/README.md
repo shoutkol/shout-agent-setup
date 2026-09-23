@@ -104,6 +104,13 @@ cd ~/shout-agent-setup && git pull
 systemctl --user restart orca-wrapper
 ```
 
+Or, once a version with the admin routes is running, without a shell on the VM:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ORCA_WRAPPER_TOKEN" https://orca.shouttgt.com/admin/deploy
+curl -H "Authorization: Bearer $ORCA_WRAPPER_TOKEN" https://orca.shouttgt.com/admin/health   # ~5 s later: new commit
+```
+
 If this update adds the `/tasks` (Notion work order) routes, the `sessions`/`jobs` schema changed
 from PR-keyed to key-keyed and the wrapper refuses to start on the old database: stop the service, `rm
 ~/.local/share/orca-wrapper/state.sqlite*`, then start it again (see orca-wrapper's own

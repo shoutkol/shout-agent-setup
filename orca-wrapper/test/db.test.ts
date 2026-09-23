@@ -16,6 +16,10 @@ import {
   markRunningJobsFailed,
   prKey,
   taskKey,
+  findJobByCommentId,
+  findActiveDuplicate,
+  markJobDone,
+  getLastOutput,
 } from "../src/db.ts";
 
 test("two queued jobs for one PR session: only one can be claimed as running", () => {
@@ -180,4 +184,54 @@ test("openDb refuses the old PR-keyed schema with a message saying how to fix it
       assert.throws(() => openDb(path), /old PR-keyed schema.*delete the state\.sqlite\* files/);
     },
   );
+});
+
+test("position counts the job already running: the second prompt on a busy session is 2", () => {
+  const db = openDb(":memory:");
+  ensurePrSession(db, 40, "feat/x");
+  assert.strictEqual(enqueueJob(db, prKey(40), 1, "alice", "a").position, 1);
+  claimNextJob(db, prKey(40)); // a is running now
+  assert.strictEqual(enqueueJob(db, prKey(40), 2, "alice", "b").position, 2);
+  assert.strictEqual(enqueueJob(db, prKey(40), 3, "alice", "c").position, 3);
+  db.close();
+});
+
+test("markRunningJobsFailed returns the jobs it failed, so the server can tell their PRs", () => {
+  const db = openDb(":memory:");
+  ensurePrSession(db, 41, "feat/x");
+  enqueueJob(db, prKey(41), 11, "alice", "a");
+  const running = claimNextJob(db, prKey(41))!;
+  enqueueJob(db, prKey(41), 12, "alice", "b"); // stays queued, must not be in the list
+  const failed = markRunningJobsFailed(db);
+  assert.deepStrictEqual(failed.map((j) => j.id), [running.id]);
+  assert.strictEqual(markRunningJobsFailed(db).length, 0); // nothing left running
+  db.close();
+});
+
+test("findJobByCommentId finds a redelivered comment; findActiveDuplicate only matches queued/running", () => {
+  const db = openDb(":memory:");
+  ensurePrSession(db, 42, "feat/x");
+  const { id } = enqueueJob(db, prKey(42), 777, "alice", "a");
+  assert.strictEqual(findJobByCommentId(db, 777)?.id, id);
+  assert.strictEqual(findJobByCommentId(db, 778), undefined);
+
+  ensureTaskSession(db, 9, "https://notion.so/wo-9", "T", "claude/WO-9-t", null, "go");
+  const first = enqueueJob(db, taskKey(9), null, "notion", "go");
+  assert.strictEqual(findActiveDuplicate(db, taskKey(9), "go")?.id, first.id);
+  assert.strictEqual(findActiveDuplicate(db, taskKey(9), "something else"), undefined);
+  const claimed = claimNextJob(db, taskKey(9))!;
+  markJobDone(db, claimed.id, "done");
+  assert.strictEqual(findActiveDuplicate(db, taskKey(9), "go"), undefined); // finished: a new Ready is a new request
+  db.close();
+});
+
+test("getLastOutput is the agent's answer, not the Notion-writeback job's reply", () => {
+  const db = openDb(":memory:");
+  ensureTaskSession(db, 10, "https://notion.so/wo-10", "T", "claude/WO-10-t", null, "go");
+  enqueueJob(db, taskKey(10), null, "notion", "go");
+  markJobDone(db, claimNextJob(db, taskKey(10))!.id, "the real answer");
+  enqueueJob(db, taskKey(10), null, "orca", "update notion", "notion-update");
+  markJobDone(db, claimNextJob(db, taskKey(10))!.id, "updated PR, Stage");
+  assert.strictEqual(getLastOutput(db, taskKey(10)), "the real answer");
+  db.close();
 });

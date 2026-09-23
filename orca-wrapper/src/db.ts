@@ -109,9 +109,8 @@ export function openDb(path: string): DatabaseSync {
     prompt_template: "TEXT",
   });
   addMissingColumns(db, "jobs", { kind: "TEXT" });
-  // Startup recovery: a job stuck "running" means the wrapper died mid-run. Never resend a
-  // prompt on restart — the agent may already have acted on it — so we fail it instead.
-  markRunningJobsFailed(db);
+  // Startup recovery (markRunningJobsFailed) is the server's call, not openDb's: it has to tell
+  // the affected PRs, which needs the list of jobs it failed.
   return db;
 }
 
@@ -133,10 +132,15 @@ function addMissingColumns(db: DatabaseSync, table: string, columns: Record<stri
   }
 }
 
-export function markRunningJobsFailed(db: DatabaseSync): void {
+// Startup recovery: a job stuck "running" means the wrapper died mid-run. Never resend a prompt
+// on restart — the agent may already have acted on it — so fail it, and return what was failed so
+// the caller can say so on each PR.
+export function markRunningJobsFailed(db: DatabaseSync): Job[] {
+  const running = db.prepare("SELECT * FROM jobs WHERE state = 'running' ORDER BY id ASC").all() as unknown as Job[];
   db.prepare("UPDATE jobs SET state = 'failed', error = 'wrapper restarted', finished_at = ? WHERE state = 'running'").run(
     Date.now(),
   );
+  return running;
 }
 
 // --- sessions -----------------------------------------------------------
@@ -256,10 +260,11 @@ export function enqueueJob(
     "INSERT INTO jobs (session_key, kind, comment_id, author, prompt, state, created_at) VALUES (?, ?, ?, ?, ?, 'queued', ?)",
   ).run(sessionKey, kind, commentId, author, prompt, now);
   const id = Number((db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id);
+  // Place in line, counting the job already running for this session: 1 = runs next (or now).
   const position = Number(
     (
       db
-        .prepare("SELECT COUNT(*) AS n FROM jobs WHERE session_key = ? AND state = 'queued' AND id <= ?")
+        .prepare("SELECT COUNT(*) AS n FROM jobs WHERE session_key = ? AND (state = 'running' OR (state = 'queued' AND id <= ?))")
         .get(sessionKey, id) as { n: number }
     ).n,
   );
@@ -278,6 +283,38 @@ export function claimNextJob(db: DatabaseSync, sessionKey: string): Job | undefi
   if (!job) return undefined;
   db.prepare("UPDATE jobs SET state = 'running' WHERE id = ?").run(job.id);
   return { ...job, state: "running" };
+}
+
+// GitHub redelivers a comment when someone re-runs the workflow; the comment id is the same.
+export function findJobByCommentId(db: DatabaseSync, commentId: number): Job | undefined {
+  return db.prepare("SELECT * FROM jobs WHERE comment_id = ? ORDER BY id ASC LIMIT 1").get(commentId) as Job | undefined;
+}
+
+// Notion/n8n can fire the same work order twice in a row; an identical prompt that is already
+// waiting or running for that session is the same request.
+export function findActiveDuplicate(db: DatabaseSync, sessionKey: string, prompt: string): Job | undefined {
+  return db
+    .prepare("SELECT * FROM jobs WHERE session_key = ? AND prompt = ? AND kind IS NULL AND state IN ('queued','running') ORDER BY id ASC LIMIT 1")
+    .get(sessionKey, prompt) as Job | undefined;
+}
+
+export function positionOf(db: DatabaseSync, job: Job): number {
+  if (job.state !== "queued" && job.state !== "running") return 0;
+  return Number(
+    (
+      db
+        .prepare("SELECT COUNT(*) AS n FROM jobs WHERE session_key = ? AND (state = 'running' OR (state = 'queued' AND id <= ?))")
+        .get(job.session_key, job.id) as { n: number }
+    ).n,
+  );
+}
+
+export function runningJobs(db: DatabaseSync): Job[] {
+  return db.prepare("SELECT * FROM jobs WHERE state = 'running' ORDER BY id ASC").all() as unknown as Job[];
+}
+
+export function queuedJobCount(db: DatabaseSync): number {
+  return Number((db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE state = 'queued'").get() as { n: number }).n);
 }
 
 export function queuedSessionKeys(db: DatabaseSync): string[] {
@@ -315,9 +352,10 @@ export function getQueue(db: DatabaseSync, sessionKey: string): Job[] {
     .all(sessionKey) as unknown as Job[];
 }
 
+// The agent's last real answer — not the Notion-writeback job's "updated these properties" reply.
 export function getLastOutput(db: DatabaseSync, sessionKey: string): string | null {
   const row = db
-    .prepare("SELECT output FROM jobs WHERE session_key = ? AND state = 'done' ORDER BY id DESC LIMIT 1")
+    .prepare("SELECT output FROM jobs WHERE session_key = ? AND state = 'done' AND kind IS NULL ORDER BY id DESC LIMIT 1")
     .get(sessionKey) as { output: string } | undefined;
   return row?.output ?? null;
 }

@@ -34,6 +34,7 @@ Read once at startup in `src/config.ts`.
 | `DB_PATH` | no | `${HOME}/.local/share/orca-wrapper/state.sqlite` | SQLite file (dir is created if missing). |
 | `IDLE_DAYS` | no | `15` | Sessions idle this long are closed by the hourly sweep. |
 | `RUN_TIMEOUT_MIN` | no | `60` | Max time to wait for one automation run to finish. |
+| `BUSY_WAIT_MIN` | no | `10` | Before a session's next run, max time to wait for its agent terminal to go idle (a timed-out or pre-restart run may still be going). Past it, the job fails with a note instead of running on top. |
 
 On startup `openDb` adds any nullable column the current schema has but the deployed database
 lacks (e.g. `sessions.prompt_template`), so a plain update keeps existing sessions. The one change
@@ -59,14 +60,20 @@ properties) so that stripping is a no-op transform, not a compile.
 ## The four Orca quirks this wrapper works around
 
 1. **`worktree create` never checks out your branch.** It always creates a *new* branch at the
-   base commit. To actually land on the PR's real head branch, we run a throwaway `git fetch &&
-   git checkout` in a terminal, then poll `worktree list` until Orca's own `branch` field flips to
-   `refs/heads/<head_ref>` — `terminal wait --for exit` does not report the shell exiting, so that
-   signal isn't available.
+   base commit. We run a throwaway `git fetch && git checkout -B` in a terminal, then poll
+   `worktree list` until Orca's own `branch` field shows the branch we asked for — `terminal wait
+   --for exit` does not report the shell exiting, so that signal isn't available. A PR session's
+   worktree goes on its own `orca/pr-<n>-<id>` branch tracking `origin/<head_ref>`, not on
+   `<head_ref>` itself: git won't check out a branch another worktree of the same clone already
+   has, and on the agent host other sessions often do. The agent pushes with `HEAD:<head_ref>`.
+   The worktree is recorded on the session only once the checkout lands; a failed checkout
+   removes it, so the next prompt starts over instead of running on Orca's branch.
 2. **One automation run per session, strictly sequential.** Firing a second `automations run`
    while one is still in flight on the same worktree makes Orca silently fork a second agent
    session. The worker enforces "no running job for this session" at the DB level before claiming
-   the next queued one; different sessions (PRs or tasks) still run concurrently.
+   the next queued one, and before each run after the first it waits (`BUSY_WAIT_MIN`) for the
+   agent terminal to go idle — a run the wrapper timed out on or lost in a restart may still be
+   going. Different sessions (PRs or tasks) still run concurrently.
 3. **Completion needs two signals, not one.** An automation run's `status` alone is unreliable: on
    a fresh session it flips to `"completed"` ~3s after dispatch, well before the agent has
    answered, while on a reused session it stays `"dispatched"` until the real end; `tui-idle` alone
@@ -78,6 +85,16 @@ properties) so that stripping is a no-op transform, not a compile.
 4. **`automations remove` does not close its terminal.** Closing a session removes the automation,
    then separately lists and closes every terminal in the worktree, then removes the worktree —
    each step logged and attempted independently so one failure doesn't skip the rest.
+
+## Long answers
+
+Orca's run snapshot stops at ~8 KB, with no truncation flag. When a snapshot is that long, the
+worker runs a one-line command in the session's worktree that prints the agent's final message
+from its Claude transcript (`~/.claude/projects/<cwd>/`), gzipped and base64'd, and reads it
+back with `orca terminal read` (which keeps ~32 KB — about 80–100 KB of prose). It's used only if
+it starts the way the snapshot does; otherwise the snapshot is posted with a warning. An answer
+over 60,000 chars (GitHub's comment limit is 65,536) posts its first part plus a secret gist with
+the full text, or several `(part i/n)` comments if the token can't create gists.
 
 ## Images in comments
 
@@ -96,16 +113,27 @@ otherwise). All JSON.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `POST` | `/pr/{n}/prompt` | `{ head_ref, base_ref, comment_id, body, author }` | 202 `{ job_id, position }`, or 202 `{ closed: true }` if `body` is `/orca stop` |
+| `POST` | `/pr/{n}/prompt` | `{ head_ref, base_ref, comment_id, body, author }` | 202 `{ job_id, position }`; 202 `{ closed: true }` for a stop; 202 `{ help: true }` for a bare `/orca` (usage posted to the PR); 202 `{ pr_closed: true }` if the PR is closed (a note is posted, nothing runs); 400 if `head_ref` isn't a plain branch name |
 | `GET` | `/pr/{n}` | — | 200 `{ session, queue, last_output }`, or 404 |
 | `DELETE` | `/pr/{n}` | — | 202 `{ closed: true }`, or 404 |
 | `POST` | `/tasks` | `{ notion_url, wo, title, prompt, author?, repo_app? }` | 202 `{ key, job_id, position }` |
 | `GET` | `/tasks/{wo}` | — | 200 `{ session, queue, last_output }`, or 404 |
 | `DELETE` | `/tasks/{wo}` | — | 202 `{ closed: true }`, or 404 |
 | `GET` | `/sessions` | — | 200, list of open sessions |
+| `GET` | `/admin/health` | — | 200 `{ commit, uptime_s, running_jobs, queued_jobs, orca }` (`orca` is `"ok"` or the error from `orca repo list`) |
+| `GET` | `/admin/logs?lines=N` | — | 200 text: the last N (default 200, max 2000) lines of `journalctl --user -u orca-wrapper` |
+| `POST` | `/admin/deploy` | `{ force? }` | 202 `{ from, to, restarting: true }` after `git pull --ff-only origin main`; 409 `{ running }` if a job is running and `force` isn't `true`; 500 if the pull fails (no restart) |
+| `POST` | `/admin/restart` | `{ force? }` | 202 `{ restarting: true }`; 409 as above |
+
+`/admin/deploy` and `/admin/restart` answer, then exit with code 75; the unit's
+`Restart=on-failure` brings the service back ~5 s later. A restart fails any running job
+(`wrapper restarted`), which is why both refuse while one runs unless `force` is `true`.
 
 `body` on `/pr/{n}/prompt` must start with `/orca` (the GitHub Actions workflow filters this too,
-but the server re-checks — see `parseCommand` in `src/logic.ts`). Unknown routes are 404. Every
+but the server re-checks — see `parseCommand` in `src/logic.ts`). `stop`, `stop.`, `Stop!`,
+`stop please` and `please stop` all stop; a longer sentence starting with "stop" is a prompt.
+`position` counts the job already running, so 1 means "runs next (or now)". A body that isn't
+JSON is a 400. Unknown routes are 404. Every
 request logs one line to stdout: method, path, status, duration.
 
 ## Tasks (Notion work orders)
@@ -131,7 +159,10 @@ through its Notion connector):
 single dashes, capped at 40 chars (see `branchFor` in `src/logic.ts`); a title with nothing
 sluggable (e.g. all-Thai) yields just `claude/WO-<wo>`. `POST /tasks` on a WO that already has a
 live session enqueues that request's own `prompt` as a follow-up job instead of starting a new one
-(the session's original `prompt` is not reused or appended).
+(the session's original `prompt` is not reused or appended). One work order is one branch and one
+PR: dispatching a WO again after its session closed carries on from the branch already on origin
+(never resets it to `dev`), and answers on the PR that branch already has — reopening it if it
+was closed without merging. Only a merged PR gets a new one for new commits.
 
 **`prompt`** is the task's actual first-run instructions to the agent — required, non-empty,
 authored in Notion and passed through by n8n exactly as written (there's no more hard-coded
@@ -152,8 +183,9 @@ Notion-writeback job (below) keeps its own hard-coded prompt and is never render
 
 **Two-run flow**, driven from `worker.ts` — unchanged except for where the first prompt comes from:
 
-1. The wrapper creates a fresh worktree, force-creates the branch off `origin/dev`, and pushes it
-   immediately (before the agent runs at all) so the branch always exists on origin. The agent is
+1. The wrapper creates a fresh worktree and puts it on the branch: from `origin/<branch>` if it
+   already exists, otherwise created off `origin/dev` and pushed immediately (before the agent runs
+   at all) so the branch always exists on origin. The agent is
    told, via the rendered `prompt`, to read the Notion page as its spec, implement it, and always
    `git push` before finishing — even if blocked, so the PR is where open questions get discussed.
 2. Once that run completes, the wrapper checks `GET /repos/{repo}/compare/dev...<branch>`. If

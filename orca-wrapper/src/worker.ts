@@ -8,9 +8,10 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { isDone, isLaunchFrame, stable, renderPrompt } from "./logic.ts";
+import { isDone, isLaunchFrame, launchMarker, stable, renderPrompt, shq } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
+import { COMMENT_MAX_CHARS, decodeAnswer, extractCommand, looksCapped, matchesSnapshot, splitText } from "./answer.ts";
 
 const POLL_MS = 5_000;
 const BRANCH_POLL_MS = 3_000;
@@ -18,8 +19,16 @@ const BRANCH_POLL_MAX_MS = 120_000;
 const TERMINAL_IDLE_TIMEOUT_MS = 4_000;
 const DOWNLOAD_WAIT_MS = 5_000;
 const DOWNLOAD_MAX_MS = 60_000;
+// Before sending the next prompt to a session that has already run, wait (config.busyWaitMin) for
+// its agent to go idle: a run the wrapper gave up on (timeout) or lost track of (restart) is often
+// still going, and a second `automations run` on top of it forks the session.
+const AGENT_IDLE_POLL_MS = 10_000;
 
 const NOTION_UPDATE_KIND = "notion-update";
+
+const IMAGES_UNAVAILABLE_NOTE =
+  "\n\nNote: the images in this comment could not be downloaded to this machine, so you cannot see " +
+  "them. Say so in your reply instead of guessing what they show.";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -27,19 +36,26 @@ function sleep(ms: number): Promise<void> {
 
 type CompletionResult = { outcome: "done"; content: string; truncated: boolean } | { outcome: "error"; reason: string };
 
+export type EnqueueResult =
+  | { jobId: number; position: number; deduped?: true }
+  | { rejected: "closing" };
+
+export type CloseResult = "closed" | "closing" | false;
+
 export function createWorker(handle: DatabaseSync) {
   // Session keys currently being processed, so tick() never claims a second job for the same
   // session while the first is still in flight (claimNextJob already prevents this at the DB
   // level too — this set just avoids a wasted claim attempt every tick).
   const active = new Set<string>();
 
-  function enqueuePrJob(
-    pr: number,
-    headRef: string,
-    commentId: number,
-    author: string,
-    prompt: string,
-  ): { jobId: number; position: number } {
+  // Re-running the workflow redelivers the same comment (same id): hand back the job we already
+  // have instead of running the prompt twice. A session that is shutting down (/orca stop while a
+  // job runs) takes nothing new — it would run against an automation that's about to be removed.
+  function enqueuePrJob(pr: number, headRef: string, commentId: number, author: string, prompt: string): EnqueueResult {
+    const dup = db.findJobByCommentId(handle, commentId);
+    if (dup) return { jobId: dup.id, position: db.positionOf(handle, dup), deduped: true };
+    const existing = db.getSessionByPr(handle, pr);
+    if (existing?.state === "closing") return { rejected: "closing" };
     const session = db.ensurePrSession(handle, pr, headRef);
     const { id, position } = db.enqueueJob(handle, session.key, commentId, author, prompt);
     tick();
@@ -51,6 +67,7 @@ export function createWorker(handle: DatabaseSync) {
   // using THIS request's prompt, not the session's original one); otherwise a fresh task session
   // is created, `prompt` is kept on it as `prompt_template` for reference, and this is its first
   // job. Either way, buildPrompt renders the job's own `prompt` at run time (see logic.renderPrompt).
+  // The same prompt already waiting or running for the WO is a duplicate delivery, not a new ask.
   function enqueueTask(
     wo: number,
     notionUrl: string,
@@ -59,10 +76,13 @@ export function createWorker(handle: DatabaseSync) {
     branch: string,
     repoAppLine: string | null,
     prompt: string,
-  ): { key: string; jobId: number; position: number } {
+  ): { key: string } & EnqueueResult {
     const key = db.taskKey(wo);
     const existing = db.getSession(handle, key);
     if (existing && existing.state !== "closed") {
+      if (existing.state === "closing") return { key, rejected: "closing" };
+      const dup = db.findActiveDuplicate(handle, key, prompt);
+      if (dup) return { key, jobId: dup.id, position: db.positionOf(handle, dup), deduped: true };
       const { id, position } = db.enqueueJob(handle, key, null, author, prompt);
       tick();
       return { key, jobId: id, position };
@@ -100,6 +120,13 @@ export function createWorker(handle: DatabaseSync) {
         session = db.getSession(handle, job.session_key)!;
       }
 
+      if (session.automation_id && !(await waitUntilAgentIdle(session))) {
+        throw new Error(
+          "the agent is still busy with an earlier request (one the wrapper stopped waiting for, or lost " +
+            "track of in a restart). Nothing was sent; ask again once it has finished",
+        );
+      }
+
       const prompt = await buildPrompt(session, job, session.worktree_id!);
       if (!session.automation_id) {
         const automationId = await orca.automationCreate(session.key, session.worktree_id!, prompt);
@@ -114,10 +141,15 @@ export function createWorker(handle: DatabaseSync) {
 
       // PR sessions always start with the same hard-coded preamble, so PREAMBLE_MARKER alone spots
       // the terminal echoing it back. A task's prompt is Notion-authored and varies per session (and
-      // per follow-up), so its own first 40 chars are the marker instead — enough to recognise the
-      // echo without false-matching on a short real answer that happens to start the same way.
-      const marker = session.kind === "pr" ? PREAMBLE_MARKER : prompt.slice(0, 40);
+      // per follow-up), so its own first 40 chars are the marker instead — or none, for a prompt
+      // too short to be told apart from an answer (see logic.launchMarker).
+      const marker = session.kind === "pr" || job.comment_id != null ? PREAMBLE_MARKER : launchMarker(prompt);
       const result = await waitForCompletion(session, runId, marker);
+      if (result.outcome === "done" && looksCapped(result.content, result.truncated)) {
+        const full = await recoverFullAnswer(session, result.content);
+        if (full) Object.assign(result, { content: full, truncated: false });
+        else Object.assign(result, { truncated: true });
+      }
       if (result.outcome === "done") {
         db.markJobDone(handle, job.id, result.content);
         db.touchSession(handle, session.key);
@@ -137,6 +169,24 @@ export function createWorker(handle: DatabaseSync) {
     } finally {
       await maybeFinishClosing(job.session_key).catch((e) => console.log(`deferred close failed key=${job.session_key}: ${e}`));
     }
+  }
+
+  // True once the session's agent terminal reports tui-idle. No handle yet (first run) or a handle
+  // Orca no longer knows (the agent is gone; Orca starts a fresh one on the next run) both count
+  // as idle — there is nothing to run on top of.
+  async function waitUntilAgentIdle(session: db.Session): Promise<boolean> {
+    if (!session.terminal_handle) return true;
+    const deadline = Date.now() + config.busyWaitMin * 60_000;
+    while (Date.now() < deadline) {
+      try {
+        if (await orca.terminalWaitIdle(session.terminal_handle, AGENT_IDLE_POLL_MS)) return true;
+      } catch (err) {
+        if (err instanceof orca.OrcaError && err.code === "terminal_handle_stale") return true;
+        throw err;
+      }
+      await sleep(1_000); // `terminal wait` normally blocks for the full poll; don't spin if it returns early
+    }
+    return false;
   }
 
   // The worktreeId prefix for reaching the BASE checkout (not any worktree) via `orca terminal
@@ -162,53 +212,72 @@ export function createWorker(handle: DatabaseSync) {
     // knows branches it has fetched — a PR branch pushed after the clone's last fetch fails with
     // "invalid reference" (seen live on PR 482). So fetch it there first, then base the throwaway
     // worktree branch on origin/<head>, which is guaranteed to exist afterwards.
-    await runInWorktree(await baseWorktreeRef(), "fetch", `git fetch origin ${headRef}; exit`, session.key);
+    await runInWorktree(await baseWorktreeRef(), "fetch", `git fetch origin ${shq(headRef)}; exit`, session.key);
     const worktreeId = await orca.worktreeCreate(session.key, `origin/${headRef}`);
-    db.updateSession(handle, session.key, { worktree_id: worktreeId });
 
-    // worktreeCreate always creates a NEW branch at the base commit — it never checks out headRef
-    // itself. `git checkout <head>` here creates the local tracking branch from origin/<head>.
-    // We poll `worktree list` until Orca's own branch field flips to confirm the checkout landed.
-    const checkoutCmd = `git fetch origin ${headRef} && git checkout ${headRef} && git branch --set-upstream-to=origin/${headRef}; exit`;
-    const checkoutHandle = await orca.terminalCreate(worktreeId, "checkout", checkoutCmd);
-    try {
-      await pollUntilCheckedOut(worktreeId, headRef);
-    } finally {
-      await orca.terminalClose(checkoutHandle).catch((err) => console.log(`checkout terminalClose failed key=${session.key}: ${err}`));
-    }
+    // Put the worktree on a local branch of our own that tracks origin/<head>, rather than on
+    // <head> itself: git refuses to check out a branch that another worktree of the same clone
+    // already has, and on the agent host other sessions routinely do (seen live on PR 492). The
+    // agent pulls from the upstream and pushes with HEAD:<head> (see preamble.ts).
+    const local = localBranchFor(session);
+    const origin = `origin/${headRef}`;
+    const checkoutCmd = `git fetch origin ${shq(headRef)} && git checkout -B ${shq(local)} ${shq(origin)} && git branch --set-upstream-to=${shq(origin)}; exit`;
+    await checkOutOrDiscard(session, worktreeId, checkoutCmd, local, `PR branch ${headRef}`);
   }
 
   async function ensureTaskWorktree(session: db.Session): Promise<void> {
     const branch = session.head_ref!; // the WO's own branch, e.g. claude/WO-12-campaign-owner-credit
     await runInWorktree(await baseWorktreeRef(), "fetch", `git fetch origin dev; exit`, session.key);
     // `--name` is only a hint: Orca sanitises slashes and may add a user prefix (e.g. turns this
-    // into `ziveso/claude-WO-12-x`), so its own branch is never the one we want — same reasoning
-    // as the PR checkout dance below, just with a branch we create ourselves instead of one that
-    // already exists on origin.
+    // into `ziveso/claude-WO-12-x`), so its own branch is never the one we want.
     const worktreeId = await orca.worktreeCreate(branch, "origin/dev");
-    db.updateSession(handle, session.key, { worktree_id: worktreeId });
 
-    // Force-create our own branch off origin/dev and push it immediately — before the agent ever
-    // runs. This guarantees the branch exists on origin so the wrapper can always open a PR later
-    // even if the agent gets nothing done, and gives the agent an upstream to push to.
-    const checkoutCmd = `git checkout -B ${branch} origin/dev && git push -u origin ${branch}; exit`;
-    const checkoutHandle = await orca.terminalCreate(worktreeId, "checkout", checkoutCmd);
+    // One work order, one branch, one PR: when the branch is already on origin (the WO was
+    // dispatched before), carry on from it; otherwise create it off origin/dev and push it right
+    // away, before the agent runs, so the wrapper can always open a PR later and the agent has an
+    // upstream to push to. Never reset an existing branch back to dev.
+    const b = shq(branch);
+    const ob = shq(`origin/${branch}`);
+    const checkoutCmd =
+      `if git fetch origin ${b}; then git checkout -B ${b} ${ob} && git branch --set-upstream-to=${ob}; ` +
+      `else git checkout -B ${b} origin/dev && git push -u origin ${b}; fi; exit`;
+    await checkOutOrDiscard(session, worktreeId, checkoutCmd, branch, `work order branch ${branch}`);
+  }
+
+  // Runs the checkout in the new worktree and waits for Orca to report `branch`. The worktree is
+  // only recorded on the session once that lands: recording it first meant a failed checkout was
+  // never retried — the next job skipped ensureWorktree and ran on Orca's own branch (H-15).
+  async function checkOutOrDiscard(session: db.Session, worktreeId: string, command: string, branch: string, what: string): Promise<void> {
+    const checkoutHandle = await orca.terminalCreate(worktreeId, "checkout", command);
     try {
       await pollUntilCheckedOut(worktreeId, branch);
+    } catch (err: any) {
+      await orca.worktreeRm(worktreeId).catch((e) => console.log(`discarding worktree failed key=${session.key}: ${e}`));
+      throw new Error(`couldn't check out the ${what} in a fresh worktree (${err?.message ?? err}). Is it still on origin?`);
     } finally {
       await orca.terminalClose(checkoutHandle).catch((err) => console.log(`checkout terminalClose failed key=${session.key}: ${err}`));
     }
+    db.updateSession(handle, session.key, { worktree_id: worktreeId });
+  }
+
+  // Per session, not per PR: a leftover worktree from an earlier session of the same PR may still
+  // hold orca/pr-<n>, and a name that's taken is exactly the collision this avoids.
+  function localBranchFor(session: db.Session): string {
+    return `orca/pr-${session.pr}-${session.created_at.toString(36)}`;
   }
 
   // One-shot shell command in a worktree, waited on until its shell exits (the command must end
   // with `; exit`). Used for git plumbing and downloads that must finish before the agent runs.
-  async function runInWorktree(worktreeId: string, title: string, command: string, sessionKey: string): Promise<void> {
+  // Returns false if it was still running at the deadline (it is closed either way).
+  async function runInWorktree(worktreeId: string, title: string, command: string, sessionKey: string): Promise<boolean> {
     const h = await orca.terminalCreate(worktreeId, title, command);
     try {
       const deadline = Date.now() + DOWNLOAD_MAX_MS;
-      while (Date.now() < deadline && !(await orca.terminalWaitExit(h, DOWNLOAD_WAIT_MS))) {
-        // keep waiting
+      while (Date.now() < deadline) {
+        if (await orca.terminalWaitExit(h, DOWNLOAD_WAIT_MS)) return true;
       }
+      console.log(`${title} still running after ${DOWNLOAD_MAX_MS}ms key=${sessionKey}`);
+      return false;
     } finally {
       await orca.terminalClose(h).catch((err) => console.log(`${title} terminalClose failed key=${sessionKey}: ${err}`));
     }
@@ -237,7 +306,10 @@ export function createWorker(handle: DatabaseSync) {
     if (files.length === 0) return job.prompt;
 
     // Signed URLs expire in minutes, so download right away — not from inside the agent's turn.
-    await runInWorktree(worktreeId, "attachments", downloadCommand(dir, files), `pr-${pr}`);
+    // If the download never finished, pointing the agent at those paths would have it describe
+    // files that may not exist; keep the URLs and say plainly that the images aren't available.
+    const finished = await runInWorktree(worktreeId, "attachments", downloadCommand(dir, files), `pr-${pr}`);
+    if (!finished) return job.prompt + IMAGES_UNAVAILABLE_NOTE;
     return rewritePrompt(job.prompt, attachments);
   }
 
@@ -247,7 +319,10 @@ export function createWorker(handle: DatabaseSync) {
   // the session's values, except the auto-generated Notion-writeback job, which is sent exactly as
   // stored (see NOTION_UPDATE_KIND in handleCompletion).
   async function buildPrompt(session: db.Session, job: db.Job, worktreeId: string): Promise<string> {
-    if (session.kind === "pr") {
+    // Any job that came from a PR comment — including an /orca comment on a work order's PR — gets
+    // the PR preamble and its images staged. Without it an /orca on a WO-PR reached the agent as
+    // bare comment text: no pull first, no "don't open PRs", no images (H-05).
+    if (session.kind === "pr" || (job.comment_id != null && session.pr)) {
       return preamble(session.head_ref!, session.pr!) + "\n\n" + (await stageAttachments(job, worktreeId, session.pr!));
     }
     if (job.kind === NOTION_UPDATE_KIND) return job.prompt;
@@ -320,13 +395,54 @@ export function createWorker(handle: DatabaseSync) {
     return { outcome: "error", reason: `timed out after ${config.runTimeoutMin} minutes` };
   }
 
+  // A snapshot at Orca's cap: read the agent's final message from its Claude transcript on the
+  // agent host instead (see answer.ts). Null if that fails or doesn't match what Orca showed —
+  // the caller then posts the snapshot with a warning.
+  async function recoverFullAnswer(session: db.Session, snapshot: string): Promise<string | null> {
+    let h: string | undefined;
+    try {
+      h = await orca.terminalCreate(session.worktree_id!, "answer", extractCommand());
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        await sleep(1_000);
+        const full = decodeAnswer(await orca.terminalRead(h, 2_000));
+        if (full !== null) return full.length > snapshot.length && matchesSnapshot(full, snapshot) ? full : null;
+      }
+      console.log(`answer recovery timed out key=${session.key}`);
+      return null;
+    } catch (err) {
+      console.log(`answer recovery failed key=${session.key}: ${err}`);
+      return null;
+    } finally {
+      if (h) await orca.terminalClose(h).catch((err) => console.log(`answer terminalClose failed key=${session.key}: ${err}`));
+    }
+  }
+
   // `who` is "@login" for PR jobs (the commenter's GitHub login) but a plain name for task jobs:
   // that author comes from n8n/Notion, and @-mentioning it would ping whoever owns that handle.
+  // Output goes inline, not folded: readers wanted the answer visible without a click. An answer
+  // too long for one comment (GitHub rejects > 65,536 chars) posts its first part and links the
+  // full text in a secret gist — or, if no gist can be made, continues over several comments.
   async function postResult(pr: number, who: string, content: string, truncated: boolean): Promise<void> {
-    const truncatedNote = truncated ? "\n\n⚠️ output truncated by Orca" : "";
-    // Output goes inline, not folded: readers wanted the answer visible without a click.
-    const body = `🐳 orca: done for ${who}'s request\n\n${content}${truncatedNote}`;
-    await github.comment(pr, body);
+    const header = `🐳 orca: done for ${who}'s request\n\n`;
+    const truncatedNote = truncated
+      ? "\n\n⚠️ Orca cut this answer off at ~8 KB and the full text couldn't be recovered from the agent's transcript."
+      : "";
+    if (content.length <= COMMENT_MAX_CHARS) {
+      await github.comment(pr, header + content + truncatedNote);
+      return;
+    }
+    const parts = splitText(content);
+    try {
+      const url = await github.createGist(`pr-${pr}-answer.md`, content, `orca answer on shoutkol/shout#${pr}`);
+      await github.comment(pr, `${header}${parts[0]}\n\n…\n\n📄 The full answer (${content.length.toLocaleString("en")} chars) is too long for a comment: ${url}${truncatedNote}`);
+    } catch (err) {
+      console.log(`gist failed pr=${pr}, posting ${parts.length} comments instead: ${err}`);
+      for (const [i, part] of parts.entries()) {
+        const last = i === parts.length - 1;
+        await github.comment(pr, `${i === 0 ? header : "🐳 orca: (continued)\n\n"}${part}\n\n(part ${i + 1}/${parts.length})${last ? truncatedNote : ""}`);
+      }
+    }
   }
 
   async function postFailure(pr: number, reason: string): Promise<void> {
@@ -358,9 +474,23 @@ export function createWorker(handle: DatabaseSync) {
       return;
     }
 
-    const body = `Notion: ${session.notion_url}\n\n${content}`;
-    const pr = await github.createPullRequest({ title: `WO-${session.wo}: ${session.title}`, head: branch, base: "dev", body });
-    db.updateSession(handle, session.key, { pr: pr.number, head_ref: branch });
+    // One work order, one PR. A re-dispatched WO (new session after the old one closed) finds the
+    // PR its branch already has: open → answer there; closed without merging → reopen it; merged →
+    // that work is done, so a new PR for the new commits.
+    const existing = await github.findPullByHead(branch);
+    let pr: { number: number; html_url: string };
+    if (existing && !existing.merged) {
+      if (existing.state === "closed") await github.reopenPullRequest(existing.number);
+      pr = existing;
+      db.updateSession(handle, session.key, { pr: pr.number, head_ref: branch });
+      await postResult(pr.number, job.author, content, truncated);
+    } else {
+      // A PR body has the same 65,536-char limit as a comment.
+      const answer = content.length <= COMMENT_MAX_CHARS ? content : `${splitText(content)[0]}\n\n…(answer truncated for the PR body)`;
+      const body = `Notion: ${session.notion_url}\n\n${answer}`;
+      pr = await github.createPullRequest({ title: `WO-${session.wo}: ${session.title}`, head: branch, base: "dev", body });
+      db.updateSession(handle, session.key, { pr: pr.number, head_ref: branch });
+    }
 
     const notionPrompt =
       `The pull request is open: ${pr.html_url} (#${pr.number}). Using your Notion tools, update the ` +
@@ -391,17 +521,38 @@ export function createWorker(handle: DatabaseSync) {
   }
 
   // Never tears down a session while a job is running for it — defer to maybeFinishClosing,
-  // called from processJob's `finally` once the in-flight job settles.
-  async function closeSession(key: string): Promise<boolean> {
+  // called from processJob's `finally` once the in-flight job settles. "closing" means exactly
+  // that: the current job still finishes and posts its answer first.
+  async function closeSession(key: string): Promise<CloseResult> {
     const session = db.getSession(handle, key);
     if (!session || session.state === "closed") return false;
     db.failQueuedJobs(handle, key, "session closed");
     if (active.has(key)) {
       db.updateSession(handle, key, { state: "closing" });
-      return true;
+      return "closing";
     }
     await teardown(session);
-    return true;
+    return "closed";
+  }
+
+  // Jobs that were running when the wrapper last stopped (db.markRunningJobsFailed at startup).
+  // Their answer is lost and the agent may or may not have acted, so tell each PR rather than
+  // leave only the 👀 reaction behind. A task with no PR yet has nowhere to say it but the log.
+  async function notifyInterrupted(jobs: db.Job[]): Promise<void> {
+    for (const job of jobs) {
+      const session = db.getSession(handle, job.session_key);
+      if (!session?.pr || job.kind === NOTION_UPDATE_KIND) {
+        console.log(`restart interrupted job=${job.id} key=${job.session_key} (no PR to tell)`);
+        continue;
+      }
+      await github
+        .comment(
+          session.pr,
+          "🐳 orca: interrupted — the wrapper restarted while this request was running, so no answer was " +
+            "captured. The agent may already have changed files or pushed; check the branch before asking again.",
+        )
+        .catch((err) => console.log(`restart notice failed key=${job.session_key}: ${err}`));
+    }
   }
 
   async function maybeFinishClosing(key: string): Promise<void> {
@@ -427,6 +578,13 @@ export function createWorker(handle: DatabaseSync) {
         console.log(`terminalList failed key=${session.key}: ${err}`);
       }
       await orca.worktreeRm(session.worktree_id).catch((err) => console.log(`worktreeRm failed key=${session.key}: ${err}`));
+      if (session.kind === "pr") {
+        // Our per-session branch (see localBranchFor) outlives the worktree otherwise.
+        const local = shq(localBranchFor(session));
+        await runInWorktree(await baseWorktreeRef(), "cleanup", `git branch -D ${local}; exit`, session.key).catch((err) =>
+          console.log(`branch cleanup failed key=${session.key}: ${err}`),
+        );
+      }
     }
     db.closeSessionRow(handle, session.key);
   }
@@ -438,7 +596,7 @@ export function createWorker(handle: DatabaseSync) {
     }
   }
 
-  return { enqueuePrJob, enqueueTask, tick, closeSession, sweepIdle };
+  return { enqueuePrJob, enqueueTask, tick, closeSession, sweepIdle, notifyInterrupted };
 }
 
 export type Worker = ReturnType<typeof createWorker>;
