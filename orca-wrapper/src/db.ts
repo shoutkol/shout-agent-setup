@@ -96,10 +96,41 @@ export function openDb(path: string): DatabaseSync {
       finished_at INTEGER
     );
   `);
+  // CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a column added to the schema
+  // above after a deployment's database was created would be missing there — and every INSERT
+  // naming it fails (a WO's first POST /tasks 500'd on `prompt_template` this way). Add any
+  // missing nullable column in place; list every column added after a table's first key-keyed
+  // version here.
+  addMissingColumns(db, "sessions", {
+    notion_url: "TEXT",
+    wo: "INTEGER",
+    title: "TEXT",
+    repo_app: "TEXT",
+    prompt_template: "TEXT",
+  });
+  addMissingColumns(db, "jobs", { kind: "TEXT" });
   // Startup recovery: a job stuck "running" means the wrapper died mid-run. Never resend a
   // prompt on restart — the agent may already have acted on it — so we fail it instead.
   markRunningJobsFailed(db);
   return db;
+}
+
+// The PR-keyed schema (sessions keyed by `pr`, no `key` column) predates POST /tasks and can't be
+// patched column by column — fail loudly with the fix instead of 500ing on every request.
+function addMissingColumns(db: DatabaseSync, table: string, columns: Record<string, string>): void {
+  const existing = new Set(
+    (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name),
+  );
+  const keyColumn = table === "sessions" ? "key" : "session_key";
+  if (!existing.has(keyColumn)) {
+    throw new Error(
+      `${table} table has the old PR-keyed schema (no ${keyColumn} column); stop the service, ` +
+        `delete the state.sqlite* files and start it again (see README "Env vars")`,
+    );
+  }
+  for (const [name, type] of Object.entries(columns)) {
+    if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+  }
 }
 
 export function markRunningJobsFailed(db: DatabaseSync): void {
