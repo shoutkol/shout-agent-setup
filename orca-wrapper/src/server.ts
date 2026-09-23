@@ -5,7 +5,8 @@ import { URL } from "node:url";
 import { config } from "./config.ts";
 import { openDb, getSessionByPr, getSession, getQueue, getLastOutput, listOpenSessions, taskKey } from "./db.ts";
 import { createWorker } from "./worker.ts";
-import { parseCommand, branchFor, isNotionUrl } from "./logic.ts";
+import { parseCommand, branchFor, isNotionUrl, isSafeRef, USAGE } from "./logic.ts";
+import * as github from "./github.ts";
 import * as admin from "./admin.ts";
 
 const WORKER_TICK_MS = 10_000;
@@ -25,6 +26,9 @@ function isAuthorized(req: IncomingMessage): boolean {
   return timingSafeEqual(provided, expected);
 }
 
+// A body that isn't JSON is the caller's mistake (400), not ours (500).
+class InvalidJson extends Error {}
+
 function readJson(req: IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -33,8 +37,8 @@ function readJson(req: IncomingMessage): Promise<any> {
       if (chunks.length === 0) return resolve({});
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      } catch (err) {
-        reject(err);
+      } catch (err: any) {
+        reject(new InvalidJson(err?.message ?? "invalid JSON"));
       }
     });
     req.on("error", reject);
@@ -96,6 +100,16 @@ export function startServer(options: { exit?: (code: number) => void } = {}) {
         send(res, 400, { error: "not an /orca command" });
         return 400;
       }
+      if (!isSafeRef(headRef)) {
+        await github.comment(pr, `🐳 orca: can't work on this PR — its branch name \`${JSON.stringify(headRef)}\` has characters the wrapper won't pass to a shell. Rename the branch to letters, digits, \`.\`, \`_\`, \`-\` and \`/\`.`);
+        send(res, 400, { error: "unsupported head_ref" });
+        return 400;
+      }
+      if (cmd.type === "help") {
+        await github.comment(pr, USAGE);
+        send(res, 202, { help: true });
+        return 202;
+      }
       if (cmd.type === "stop") {
         // Session may not exist under key `pr-<n>` — it could be a task session whose PR this is.
         // getSessionByPr finds either; when there's truly nothing to close, closeSession no-ops
@@ -104,6 +118,11 @@ export function startServer(options: { exit?: (code: number) => void } = {}) {
         const session = getSessionByPr(db, pr);
         await worker.closeSession(session?.key ?? `pr-${pr}`);
         send(res, 202, { closed: true });
+        return 202;
+      }
+      if ((await github.pullState(pr)) === "closed") {
+        await github.comment(pr, `🐳 orca: PR #${pr} is closed, so there's no session to run this in. Reopen the PR to use /orca again.`);
+        send(res, 202, { pr_closed: true });
         return 202;
       }
       const { jobId, position } = worker.enqueuePrJob(pr, headRef, commentId, author, cmd.prompt);
@@ -167,6 +186,7 @@ export function startServer(options: { exit?: (code: number) => void } = {}) {
         } catch {
           rawRepoApp = [rawRepoApp];
         }
+        if (typeof rawRepoApp === "string") rawRepoApp = [rawRepoApp]; // '"shout-web"' — a JSON string, not a list
       }
       const repoApp: string[] = Array.isArray(rawRepoApp) ? rawRepoApp.filter((x: unknown) => typeof x === "string") : [];
 
@@ -255,6 +275,10 @@ export function startServer(options: { exit?: (code: number) => void } = {}) {
     const path = req.url ?? "/";
     handle(req, res)
       .catch((err) => {
+        if (err instanceof InvalidJson) {
+          if (!res.headersSent) send(res, 400, { error: "invalid JSON body" });
+          return 400;
+        }
         console.log(`unhandled error on ${method} ${path}: ${err?.stack ?? err}`);
         if (!res.headersSent) send(res, 500, { error: "internal error" });
         return 500;

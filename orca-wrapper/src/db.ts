@@ -256,10 +256,11 @@ export function enqueueJob(
     "INSERT INTO jobs (session_key, kind, comment_id, author, prompt, state, created_at) VALUES (?, ?, ?, ?, ?, 'queued', ?)",
   ).run(sessionKey, kind, commentId, author, prompt, now);
   const id = Number((db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id);
+  // Place in line, counting the job already running for this session: 1 = runs next (or now).
   const position = Number(
     (
       db
-        .prepare("SELECT COUNT(*) AS n FROM jobs WHERE session_key = ? AND state = 'queued' AND id <= ?")
+        .prepare("SELECT COUNT(*) AS n FROM jobs WHERE session_key = ? AND (state = 'running' OR (state = 'queued' AND id <= ?))")
         .get(sessionKey, id) as { n: number }
     ).n,
   );

@@ -181,3 +181,13 @@ test("openDb refuses the old PR-keyed schema with a message saying how to fix it
     },
   );
 });
+
+test("position counts the job already running: the second prompt on a busy session is 2", () => {
+  const db = openDb(":memory:");
+  ensurePrSession(db, 40, "feat/x");
+  assert.strictEqual(enqueueJob(db, prKey(40), 1, "alice", "a").position, 1);
+  claimNextJob(db, prKey(40)); // a is running now
+  assert.strictEqual(enqueueJob(db, prKey(40), 2, "alice", "b").position, 2);
+  assert.strictEqual(enqueueJob(db, prKey(40), 3, "alice", "c").position, 3);
+  db.close();
+});
