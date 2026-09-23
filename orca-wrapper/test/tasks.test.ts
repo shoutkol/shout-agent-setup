@@ -69,3 +69,12 @@ test("renderPrompt: placeholders only match the vars' own keys, never Object.pro
     "{{constructor}} {{toString}} {{hasOwnProperty}} {{__proto__}}",
   );
 });
+
+test("preamble: names the remote branch for the push, since the local branch may not match it", async () => {
+  const { preamble, PREAMBLE_MARKER } = await import("../src/preamble.ts");
+  const text = preamble("claude/WO-74-x", 491);
+  assert.ok(text.startsWith(PREAMBLE_MARKER));
+  assert.ok(text.includes("`git push origin HEAD:claude/WO-74-x`"));
+  assert.ok(text.includes("`git pull --ff-only`"));
+  assert.ok(text.includes("PR #491"));
+});
