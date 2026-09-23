@@ -8,7 +8,7 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { isDone, isLaunchFrame, stable, renderPrompt, shq } from "./logic.ts";
+import { isDone, isLaunchFrame, launchMarker, stable, renderPrompt, shq } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
 
@@ -140,9 +140,9 @@ export function createWorker(handle: DatabaseSync) {
 
       // PR sessions always start with the same hard-coded preamble, so PREAMBLE_MARKER alone spots
       // the terminal echoing it back. A task's prompt is Notion-authored and varies per session (and
-      // per follow-up), so its own first 40 chars are the marker instead — enough to recognise the
-      // echo without false-matching on a short real answer that happens to start the same way.
-      const marker = session.kind === "pr" ? PREAMBLE_MARKER : prompt.slice(0, 40);
+      // per follow-up), so its own first 40 chars are the marker instead — or none, for a prompt
+      // too short to be told apart from an answer (see logic.launchMarker).
+      const marker = session.kind === "pr" ? PREAMBLE_MARKER : launchMarker(prompt);
       const result = await waitForCompletion(session, runId, marker);
       if (result.outcome === "done") {
         db.markJobDone(handle, job.id, result.content);
