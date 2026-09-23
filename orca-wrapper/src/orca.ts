@@ -119,10 +119,18 @@ export async function terminalWaitExit(handle: string, ms: number): Promise<bool
   }
 }
 
-// Accumulated output lines (escape sequences stripped). Orca keeps only ~32 KB per terminal.
-export async function terminalRead(handle: string, limit: number): Promise<string[]> {
-  const result = await run(["terminal", "read", "--terminal", handle, "--limit", String(limit)]);
-  return result.terminal?.tail ?? [];
+// Accumulated output lines (escape sequences stripped), from `cursor` on if given. Orca keeps only
+// ~32 KB per terminal; `oldestCursor` moves past lines it has dropped. Cursors are line numbers.
+export async function terminalRead(
+  handle: string,
+  cursor?: number,
+): Promise<{ lines: string[]; start: number; next: number; oldest: number }> {
+  const args = ["terminal", "read", "--terminal", handle, "--limit", "2000"];
+  if (cursor !== undefined) args.push("--cursor", String(cursor));
+  const t = (await run(args)).terminal ?? {};
+  const lines: string[] = t.tail ?? [];
+  const next = Number(t.nextCursor ?? 0);
+  return { lines, next, start: cursor ?? next - lines.length, oldest: Number(t.oldestCursor ?? 0) };
 }
 
 export async function terminalClose(handle: string): Promise<void> {

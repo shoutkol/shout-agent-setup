@@ -4,9 +4,11 @@
 // message from Claude's own transcript on the agent host, and posting splits what can't fit.
 //
 // Getting bytes back from the agent host: the only channel is `orca terminal read`, which keeps
-// ~32 KB of a terminal's output. The transcript extract is therefore gzipped and base64'd in long
-// lines — ordinary prose compresses 3–4×, comfortably past GitHub's own limit.
+// ~32 KB of a terminal's output. So the transcript extract is gzipped, base64'd in 4,000-char
+// lines, and printed one line per second, while the worker reads new lines by cursor (see
+// readFullAnswer) — the retention window never fills. A 73 KB answer (`seq 1 14000`) is 11 lines.
 import { gunzipSync } from "node:zlib";
+import * as orca from "./orca.ts";
 
 export const SNAPSHOT_CAP_BYTES = 7_000; // at or above this, assume Orca cut the snapshot
 export const COMMENT_MAX_CHARS = 60_000; // GitHub's hard limit is 65,536; leave room for the header
@@ -46,7 +48,36 @@ print("\\n\\n".join(out), end="")
 // is fed through line by line (several seconds, PS2 prompts in the output).
 export function extractCommand(): string {
   const program = Buffer.from(EXTRACT_PY, "utf8").toString("base64");
-  return `python3 -c "$(echo ${program} | base64 -d)" | gzip -c | base64 -w 4000; echo ${ANSWER_END}`;
+  return (
+    `python3 -c "$(echo ${program} | base64 -d)" | gzip -c | base64 -w 4000 | ` +
+    `while IFS= read -r l; do echo "$l"; sleep 1; done; echo ${ANSWER_END}`
+  );
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Runs extractCommand in the worktree and collects its output by line number, reading only new
+// lines each second. Null if it doesn't finish in time, Orca dropped lines before they were read,
+// or the result doesn't decode. The terminal is closed either way.
+export async function readFullAnswer(worktreeId: string, maxMs = 180_000): Promise<string | null> {
+  const h = await orca.terminalCreate(worktreeId, "answer", extractCommand());
+  const byLine = new Map<number, string>();
+  let cursor: number | undefined;
+  try {
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline) {
+      await sleep(1_000);
+      const r = await orca.terminalRead(h, cursor);
+      if (cursor !== undefined && r.oldest > cursor) return null; // lines we never saw are gone
+      r.lines.forEach((line, i) => byLine.set(r.start + i, line)); // a re-read line overwrites
+      cursor = Math.max(r.start, r.next - 1); // re-read the last line: it may have been partial
+      const ordered = [...byLine.entries()].sort((a, b) => a[0] - b[0]).map(([, l]) => l);
+      if (ordered.includes(ANSWER_END)) return decodeAnswer(ordered);
+    }
+    return null;
+  } finally {
+    await orca.terminalClose(h).catch(() => {});
+  }
 }
 
 // Decodes what `terminal read` returned. Null if the end marker isn't there yet, or if the

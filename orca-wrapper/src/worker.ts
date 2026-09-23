@@ -11,7 +11,7 @@ import * as github from "./github.ts";
 import { isDone, isLaunchFrame, launchMarker, stable, renderPrompt, shq } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
-import { COMMENT_MAX_CHARS, decodeAnswer, extractCommand, looksCapped, matchesSnapshot, splitText } from "./answer.ts";
+import { COMMENT_MAX_CHARS, looksCapped, matchesSnapshot, readFullAnswer, splitText } from "./answer.ts";
 
 const POLL_MS = 5_000;
 const BRANCH_POLL_MS = 3_000;
@@ -399,22 +399,13 @@ export function createWorker(handle: DatabaseSync) {
   // agent host instead (see answer.ts). Null if that fails or doesn't match what Orca showed —
   // the caller then posts the snapshot with a warning.
   async function recoverFullAnswer(session: db.Session, snapshot: string): Promise<string | null> {
-    let h: string | undefined;
     try {
-      h = await orca.terminalCreate(session.worktree_id!, "answer", extractCommand());
-      const deadline = Date.now() + 30_000;
-      while (Date.now() < deadline) {
-        await sleep(1_000);
-        const full = decodeAnswer(await orca.terminalRead(h, 2_000));
-        if (full !== null) return full.length > snapshot.length && matchesSnapshot(full, snapshot) ? full : null;
-      }
-      console.log(`answer recovery timed out key=${session.key}`);
-      return null;
+      const full = await readFullAnswer(session.worktree_id!);
+      if (full === null) console.log(`answer recovery got nothing key=${session.key}`);
+      return full !== null && full.length > snapshot.length && matchesSnapshot(full, snapshot) ? full : null;
     } catch (err) {
       console.log(`answer recovery failed key=${session.key}: ${err}`);
       return null;
-    } finally {
-      if (h) await orca.terminalClose(h).catch((err) => console.log(`answer terminalClose failed key=${session.key}: ${err}`));
     }
   }
 

@@ -5,7 +5,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
-import { ANSWER_END, COMMENT_MAX_CHARS, decodeAnswer, extractCommand, looksCapped, matchesSnapshot, splitText } from "../src/answer.ts";
+
+// answer.ts pulls in orca.ts -> config.ts, which reads env at import time.
+process.env.ORCA_WRAPPER_TOKEN = "test-token";
+process.env.ORCA_REPO_ID = "repo-id";
+process.env.GITHUB_DRY_RUN = "1";
+process.env.GITHUB_TOKEN = "gh-test";
+process.env.DB_PATH = ":memory:";
+const { ANSWER_END, COMMENT_MAX_CHARS, decodeAnswer, extractCommand, looksCapped, matchesSnapshot, splitText } = await import("../src/answer.ts");
 
 // What `base64 -w 4000` + the end marker look like after `terminal read`, with the typed command
 // line and a shell prompt around it.

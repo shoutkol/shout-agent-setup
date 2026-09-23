@@ -90,8 +90,9 @@ properties) so that stripping is a no-op transform, not a compile.
 
 Orca's run snapshot stops at ~8 KB, with no truncation flag. When a snapshot is that long, the
 worker runs a one-line command in the session's worktree that prints the agent's final message
-from its Claude transcript (`~/.claude/projects/<cwd>/`), gzipped and base64'd, and reads it
-back with `orca terminal read` (which keeps ~32 KB — about 80–100 KB of prose). It's used only if
+from its Claude transcript (`~/.claude/projects/<cwd>/`), gzipped and base64'd in 4,000-char lines
+at one line per second, and reads the new lines by cursor with `orca terminal read` (which keeps
+only ~32 KB, so a one-shot read loses the start of anything bigger). It's used only if
 it starts the way the snapshot does; otherwise the snapshot is posted with a warning. An answer
 over 60,000 chars (GitHub's comment limit is 65,536) posts its first part plus a secret gist with
 the full text, or several `(part i/n)` comments if the token can't create gists.
