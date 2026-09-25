@@ -60,6 +60,33 @@ export function isDone(status: string, idle: boolean): RunOutcome {
   return "pending";
 }
 
+// What the agent's Claude transcript says about the run since our prompt (see answer.ts's
+// readTurnState): how many background sub-agents were still running when its latest turn ended,
+// whether any turn in this run left one running, and the final message of that latest turn.
+export interface TurnState {
+  pending: number;
+  background: boolean;
+  answer: string;
+}
+
+export type BackgroundVerdict = "wait" | "transcript" | "snapshot";
+
+// A turn ending is not the work ending. An agent that fans out to background sub-agents
+// (`/code-review` does) ends its turn at once with "waiting for the reviewers", and every signal
+// in isDone/stable/isLaunchFrame reads that as the answer — posted live on PR 491 and PR 528,
+// while the real report came a turn later, after the sub-agents' notifications woke it up. So:
+//   wait       — the latest turn left sub-agents running; the real answer hasn't been written.
+//   transcript — sub-agents ran and are done; take the answer from the transcript, because the
+//                snapshot can still show an earlier turn (PR 491: the post was turn 2's "waiting"
+//                although turn 3's report was already on disk).
+//   snapshot   — no sub-agents, or the transcript couldn't be read: the snapshot, as before.
+export function backgroundVerdict(state: TurnState | null): BackgroundVerdict {
+  if (state === null) return "snapshot";
+  if (state.pending > 0) return "wait";
+  if (state.background && state.answer.trim()) return "transcript";
+  return "snapshot";
+}
+
 // The stabiliser: a fresh session's first output snapshot can be a raw TUI frame that Orca later
 // replaces with the clean final message, so we wait for two consecutive polls to report the same
 // `capturedAt` before trusting the content. Takes the sequence of capturedAt readings seen so far

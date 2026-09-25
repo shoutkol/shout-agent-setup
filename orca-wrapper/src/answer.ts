@@ -9,6 +9,7 @@
 // readFullAnswer) — the retention window never fills. A 73 KB answer (`seq 1 14000`) is 11 lines.
 import { gunzipSync } from "node:zlib";
 import * as orca from "./orca.ts";
+import type { TurnState } from "./logic.ts";
 
 export const SNAPSHOT_CAP_BYTES = 7_000; // at or above this, assume Orca cut the snapshot
 export const COMMENT_MAX_CHARS = 60_000; // GitHub's hard limit is 65,536; leave room for the header
@@ -44,10 +45,45 @@ for line in (open(files[-1], encoding="utf-8") if files else []):
 print("\\n\\n".join(out), end="")
 `;
 
+// Background sub-agents (see logic.backgroundVerdict). Scoped to the run since our prompt — the
+// last typed user message; a task-notification or a skill's injected text is the same run going
+// on, not a new one. Claude closes every turn with a `turn_duration` entry, and one that ended with
+// sub-agents still running carries `pendingBackgroundAgentCount`. `answer` is picked exactly as
+// EXTRACT_PY picks it. Prints one JSON object; does NOT exit, same as EXTRACT_PY.
+const TURN_STATE_PY = `
+import os, re, json, glob
+d = os.path.expanduser("~/.claude/projects/" + re.sub(r"[^a-zA-Z0-9]", "-", os.getcwd()))
+files = sorted(glob.glob(d + "/*.jsonl"), key=os.path.getmtime)
+pending, background, out = 0, False, []
+for line in (open(files[-1], encoding="utf-8") if files else []):
+    try:
+        o = json.loads(line)
+    except Exception:
+        continue
+    t = o.get("type")
+    c = (o.get("message") or {}).get("content")
+    if t == "user":
+        notification = (o.get("origin") or {}).get("kind") == "task-notification" or (
+            isinstance(c, str) and c.startswith("<task-notification>"))
+        if isinstance(c, str) and not o.get("isMeta") and not notification:
+            pending, background = 0, False
+        out = []
+    elif t == "assistant" and isinstance(c, list):
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "text":
+                out.append(b.get("text", ""))
+            elif isinstance(b, dict) and b.get("type") == "tool_use":
+                out = []
+    elif t == "system" and o.get("subtype") == "turn_duration":
+        pending = int(o.get("pendingBackgroundAgentCount") or 0)
+        background = background or pending > 0
+print(json.dumps({"pending": pending, "background": background, "answer": "\\n\\n".join(out)}), end="")
+`;
+
 // One line: Orca types the command into an interactive shell, and a multi-line `python3 -c '…'`
 // is fed through line by line (several seconds, PS2 prompts in the output).
-export function extractCommand(): string {
-  const program = Buffer.from(EXTRACT_PY, "utf8").toString("base64");
+export function extractCommand(python: string = EXTRACT_PY): string {
+  const program = Buffer.from(python, "utf8").toString("base64");
   return (
     `python3 -c "$(echo ${program} | base64 -d)" | gzip -c | base64 -w 4000 | ` +
     `while IFS= read -r l; do echo "$l"; sleep 1; done; echo ${ANSWER_END}`
@@ -56,11 +92,37 @@ export function extractCommand(): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// Runs extractCommand in the worktree and collects its output by line number, reading only new
+// The agent's full final message, from its transcript (see EXTRACT_PY).
+export async function readFullAnswer(worktreeId: string, maxMs = 180_000): Promise<string | null> {
+  return readExtract(worktreeId, "answer", extractCommand(), maxMs);
+}
+
+export function turnStateCommand(): string {
+  return extractCommand(TURN_STATE_PY);
+}
+
+// The transcript's view of the current run, or null if it can't be read — the caller then
+// decides from Orca's snapshot alone, as before background sub-agents were handled.
+export async function readTurnState(worktreeId: string, maxMs = 30_000): Promise<TurnState | null> {
+  const text = await readExtract(worktreeId, "turn-state", turnStateCommand(), maxMs);
+  return text === null ? null : parseTurnState(text);
+}
+
+export function parseTurnState(text: string): TurnState | null {
+  try {
+    const o = JSON.parse(text);
+    if (typeof o?.pending !== "number" || typeof o?.background !== "boolean" || typeof o?.answer !== "string") return null;
+    return { pending: o.pending, background: o.background, answer: o.answer };
+  } catch {
+    return null;
+  }
+}
+
+// Runs an extractCommand in the worktree and collects its output by line number, reading only new
 // lines each second. Null if it doesn't finish in time, Orca dropped lines before they were read,
 // or the result doesn't decode. The terminal is closed either way.
-export async function readFullAnswer(worktreeId: string, maxMs = 180_000): Promise<string | null> {
-  const h = await orca.terminalCreate(worktreeId, "answer", extractCommand());
+async function readExtract(worktreeId: string, title: string, command: string, maxMs: number): Promise<string | null> {
+  const h = await orca.terminalCreate(worktreeId, title, command);
   const byLine = new Map<number, string>();
   let cursor: number | undefined;
   try {
