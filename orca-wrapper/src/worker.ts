@@ -8,10 +8,10 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { isDone, isLaunchFrame, launchMarker, stable, renderPrompt, shq } from "./logic.ts";
+import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, stable, renderPrompt, shq } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
-import { COMMENT_MAX_CHARS, looksCapped, matchesSnapshot, readFullAnswer, splitText } from "./answer.ts";
+import { COMMENT_MAX_CHARS, looksCapped, matchesSnapshot, readFullAnswer, readTurnState, splitText } from "./answer.ts";
 
 const POLL_MS = 5_000;
 const BRANCH_POLL_MS = 3_000;
@@ -23,6 +23,8 @@ const DOWNLOAD_MAX_MS = 60_000;
 // its agent to go idle: a run the wrapper gave up on (timeout) or lost track of (restart) is often
 // still going, and a second `automations run` on top of it forks the session.
 const AGENT_IDLE_POLL_MS = 10_000;
+// While background sub-agents are still running, how often to re-read the transcript.
+const TURN_STATE_RECHECK_MS = 15_000;
 
 const NOTION_UPDATE_KIND = "notion-update";
 
@@ -34,7 +36,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type CompletionResult = { outcome: "done"; content: string; truncated: boolean } | { outcome: "error"; reason: string };
+// `fromTranscript`: content is already the transcript's full final message, so there is nothing
+// for recoverFullAnswer to recover even when it is long.
+type CompletionResult =
+  | { outcome: "done"; content: string; truncated: boolean; fromTranscript?: boolean }
+  | { outcome: "error"; reason: string };
 
 export type EnqueueResult =
   | { jobId: number; position: number; deduped?: true }
@@ -145,7 +151,7 @@ export function createWorker(handle: DatabaseSync) {
       // too short to be told apart from an answer (see logic.launchMarker).
       const marker = session.kind === "pr" || job.comment_id != null ? PREAMBLE_MARKER : launchMarker(prompt);
       const result = await waitForCompletion(session, runId, marker);
-      if (result.outcome === "done" && looksCapped(result.content, result.truncated)) {
+      if (result.outcome === "done" && !result.fromTranscript && looksCapped(result.content, result.truncated)) {
         const full = await recoverFullAnswer(session, result.content);
         if (full) Object.assign(result, { content: full, truncated: false });
         else Object.assign(result, { truncated: true });
@@ -354,6 +360,7 @@ export function createWorker(handle: DatabaseSync) {
     // point at a dead tab. The row keeps the latest handle only so teardown has something to close.
     let terminalHandle: string | undefined;
     let prevCapturedAt: string | null = null;
+    let nextTurnStateAt = 0;
 
     while (Date.now() < deadline) {
       const runs = await orca.automationRuns(session.automation_id!);
@@ -385,8 +392,17 @@ export function createWorker(handle: DatabaseSync) {
       const snap = run.outputSnapshot;
       const capturedAt = snap?.capturedAt ?? null;
       const realAnswer = snap != null && !isLaunchFrame(snap.content, marker);
-      if (isDone(run.status, idle) === "done" && realAnswer && stable([prevCapturedAt, capturedAt])) {
-        return { outcome: "done", content: snap!.content, truncated: snap!.truncated };
+      if (isDone(run.status, idle) === "done" && realAnswer && stable([prevCapturedAt, capturedAt]) && Date.now() >= nextTurnStateAt) {
+        // The turn is over; the work may not be — see logic.backgroundVerdict.
+        const state = await readTurnState(session.worktree_id!).catch((err) => {
+          console.log(`turn state read failed key=${session.key}: ${err}`);
+          return null;
+        });
+        const verdict = backgroundVerdict(state);
+        if (verdict === "transcript") return { outcome: "done", content: state!.answer, truncated: false, fromTranscript: true };
+        if (verdict === "snapshot") return { outcome: "done", content: snap!.content, truncated: snap!.truncated };
+        console.log(`key=${session.key}: turn ended with ${state!.pending} background agent(s) still running, waiting`);
+        nextTurnStateAt = Date.now() + TURN_STATE_RECHECK_MS;
       }
       prevCapturedAt = capturedAt;
 

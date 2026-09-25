@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isDone, isLaunchFrame, launchMarker, stable } from "../src/logic.ts";
+import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, stable } from "../src/logic.ts";
 import { readFileSync } from "node:fs";
 
 test("fresh session: early completed but not idle -> pending", () => {
@@ -104,4 +104,20 @@ test("launch frame: answers using ordinary bullets, arrows or 'for 5s' still pas
   ]) {
     assert.strictEqual(isLaunchFrame(answer, MARKER), false, answer);
   }
+});
+
+test("backgroundVerdict: a turn that left sub-agents running is not the answer (PR 491)", () => {
+  assert.strictEqual(backgroundVerdict({ pending: 2, background: true, answer: "Both reviewers are running." }), "wait");
+  assert.strictEqual(backgroundVerdict({ pending: 1, background: true, answer: "Spec done, waiting for Standards." }), "wait");
+});
+
+test("backgroundVerdict: once sub-agents are done, the transcript's answer beats a lagging snapshot", () => {
+  assert.strictEqual(backgroundVerdict({ pending: 0, background: true, answer: "## Code review\n\n…" }), "transcript");
+  // …unless the transcript has no text to offer
+  assert.strictEqual(backgroundVerdict({ pending: 0, background: true, answer: "  " }), "snapshot");
+});
+
+test("backgroundVerdict: no sub-agents, or an unreadable transcript -> the snapshot, as before", () => {
+  assert.strictEqual(backgroundVerdict({ pending: 0, background: false, answer: "done" }), "snapshot");
+  assert.strictEqual(backgroundVerdict(null), "snapshot");
 });

@@ -81,7 +81,14 @@ properties) so that stripping is a no-op transform, not a compile.
    the real answer in every case measured — see `isDone` in `src/logic.ts`. Even then, the first
    output snapshot can be a raw TUI frame that Orca later replaces, so we also wait for
    `outputSnapshot.capturedAt` to repeat on two consecutive polls (`stable` in `src/logic.ts`)
-   before trusting the content.
+   before trusting the content. And a finished *turn* is not always finished *work*: an agent
+   that starts background sub-agents (`/code-review` does) ends its turn at once with "waiting
+   for the reviewers", and the real answer comes a turn or two later. So before accepting a run,
+   the worker reads the agent's Claude transcript (same channel as [Long answers](#long-answers)):
+   if the latest turn ended with `pendingBackgroundAgentCount > 0` it keeps waiting, and once the
+   sub-agents are done it posts the transcript's final message rather than the snapshot, which
+   can still show an earlier turn (`backgroundVerdict` in `src/logic.ts`). An unreadable
+   transcript falls back to the snapshot.
 4. **`automations remove` does not close its terminal.** Closing a session removes the automation,
    then separately lists and closes every terminal in the worktree, then removes the worktree —
    each step logged and attempted independently so one failure doesn't skip the rest.
