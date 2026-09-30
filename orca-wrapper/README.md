@@ -204,6 +204,9 @@ Notion-writeback job (below) keeps its own hard-coded prompt and is never render
    write `PR`, `PR Number`, `Branch`, `Stage: In PR`, and `Last Agent Run` back onto the Notion
    page. That job's output is logged, not posted anywhere, since there's no PR comment for it yet
    the first time around.
+3. A first run that fails instead — most often `RUN_TIMEOUT_MIN` running out while the agent is
+   still working — goes through the same check. If the branch has commits the PR opens anyway, its
+   body saying why the agent's report is missing, since the agent has usually pushed by then.
 
 From then on the session behaves like a PR session: further task runs, or `/orca ...` comments on
 the now-open PR (same session, found via `getSessionByPr`), post their output as a PR comment.
