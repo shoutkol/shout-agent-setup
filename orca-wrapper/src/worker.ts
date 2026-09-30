@@ -473,7 +473,12 @@ export function createWorker(handle: DatabaseSync) {
       await postResult(session.pr, job.author, content, truncated);
       return;
     }
+    await openTaskPr(session, job, content, truncated);
+  }
 
+  // A task's first PR, once its branch has commits: opened, or re-attached if the branch already
+  // has one, then the agent is asked to write it back onto the Notion page.
+  async function openTaskPr(session: db.Session, job: db.Job, content: string, truncated: boolean): Promise<void> {
     const branch = session.head_ref!;
     const aheadBy = await github.compareAhead("dev", branch);
     if (aheadBy === 0) {
@@ -521,10 +526,17 @@ export function createWorker(handle: DatabaseSync) {
       await postFailure(session.pr, reason);
       return;
     }
-    // No PR to comment on yet (this may be the very first run, e.g. it failed before pushing
-    // anything) — nothing in GitHub or Notion to tell, so just log it. A follow-up POST /tasks
-    // can retry the session.
+    // No PR yet. A run the wrapper stopped waiting for has often pushed real work already, and the
+    // agent may still be pushing (wo-444 timed out at 60 min and finished 7 min later), so open
+    // the PR anyway when the branch has commits: like a red verify, it's where this gets discussed.
+    // A run that failed before pushing anything still opens nothing; a follow-up POST /tasks can
+    // retry the session.
     console.log(`task ${session.key}: run failed before any PR — ${reason}`);
+    const note =
+      `⚠️ orca-wrapper opened this PR without the agent's final report: the run ended with "${reason}". ` +
+      `The agent may still have been working, so check the latest commits and the Notion page's comment.`;
+    // Caught here: a throw would land in processJob's catch, which overwrites the job's real error.
+    await openTaskPr(session, job, note, false).catch((err) => console.log(`task ${session.key}: PR after failed run not opened — ${err}`));
   }
 
   // Never tears down a session while a job is running for it — defer to maybeFinishClosing,
