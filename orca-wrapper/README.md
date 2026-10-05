@@ -89,7 +89,9 @@ properties) so that stripping is a no-op transform, not a compile.
    if the latest turn ended with `pendingBackgroundAgentCount > 0` it keeps waiting, and once the
    sub-agents are done it posts the transcript's final message rather than the snapshot, which
    can still show an earlier turn (`backgroundVerdict` in `src/logic.ts`). An unreadable
-   transcript falls back to the snapshot.
+   transcript is read again every 15 s while the agent stays idle, and only 3 failed reads in a
+   row fall back to the snapshot: on wo-475 a single failed read let a "waiting for the spec
+   review" turn through as the answer before the agent had pushed, so no PR was opened.
 4. **`automations remove` does not close its terminal.** Closing a session removes the automation,
    then separately lists and closes every terminal in the worktree, then removes the worktree —
    each step logged and attempted independently so one failure doesn't skip the rest. All of it
