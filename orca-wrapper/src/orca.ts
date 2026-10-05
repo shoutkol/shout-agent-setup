@@ -46,30 +46,55 @@ async function run(args: string[], tolerateCode?: string): Promise<any> {
   return parsed.result;
 }
 
-// Absolute path of the base checkout behind config.repoId (e.g. /home/dev/repo on the droplet).
-// Looked up once: it is where `git fetch` must run before a worktree can be based on a branch.
-let cachedRepoPath: string | undefined;
-export async function repoPath(): Promise<string> {
-  if (cachedRepoPath) return cachedRepoPath;
+type RepoEntry = { id: string; path?: string; rootPath?: string; executionHostId?: string };
+
+async function repoList(): Promise<RepoEntry[]> {
   const result = await run(["repo", "list"]);
-  const repos: Array<{ id: string; path?: string; rootPath?: string }> = result.repos ?? result.repositories ?? result;
-  const repo = repos.find((r) => r.id === config.repoId);
+  return result.repos ?? result.repositories ?? result;
+}
+
+// Absolute path of the base checkout behind a repo id (e.g. /home/dev/repo on a droplet).
+// Looked up once per id: it is where `git fetch` must run before a worktree can be based on a branch.
+const cachedRepoPaths = new Map<string, string>();
+export async function repoPath(repoId: string): Promise<string> {
+  const cached = cachedRepoPaths.get(repoId);
+  if (cached) return cached;
+  const repo = (await repoList()).find((r) => r.id === repoId);
   const path = repo?.path ?? repo?.rootPath;
-  if (!path) throw new OrcaError("repo_not_found", `repo ${config.repoId} not in orca repo list`);
-  cachedRepoPath = path;
+  if (!path) throw new OrcaError("repo_not_found", `repo ${repoId} not in orca repo list`);
+  cachedRepoPaths.set(repoId, path);
   return path;
+}
+
+// repoId -> executionHostId, as Orca gives it (e.g. "ssh:ssh-1790059529678-q7yrky"). The same
+// GitHub repo registered on two SSH targets is two entries here with different ids.
+export async function repoHosts(): Promise<Map<string, string>> {
+  const hosts = new Map<string, string>();
+  for (const r of await repoList()) if (r.executionHostId) hosts.set(r.id, r.executionHostId);
+  return hosts;
+}
+
+// Host ids (in repoHosts' form) of the hosts Orca is currently connected to. `host list` ids have
+// no "ssh:" prefix while a repo's executionHostId does, so the prefix is added here, once.
+export async function hostsConnected(): Promise<Set<string>> {
+  const result = await run(["host", "list"]);
+  const connected = new Set<string>();
+  for (const h of result.hosts as Array<{ kind: string; id: string; connected: boolean }>) {
+    if (h.connected === true) connected.add(h.kind === "ssh" ? `ssh:${h.id}` : h.id);
+  }
+  return connected;
 }
 
 // Always creates a NEW branch named `name` at baseBranch's current commit — it does not check
 // out baseBranch itself (see the checkout dance in worker.ts's ensureWorktree). baseBranch is
 // resolved by git in the base checkout, so it must already exist there as a local or
 // remote-tracking ref ("origin/x" after a fetch is the safe form).
-export async function worktreeCreate(name: string, baseBranch: string): Promise<string> {
+export async function worktreeCreate(name: string, baseBranch: string, repoId: string): Promise<string> {
   const result = await run([
     "worktree",
     "create",
     "--repo",
-    `id:${config.repoId}`,
+    `id:${repoId}`,
     "--name",
     name,
     "--no-parent",
@@ -82,6 +107,17 @@ export async function worktreeCreate(name: string, baseBranch: string): Promise<
 export async function worktreeList(): Promise<Array<{ id: string; branch: string }>> {
   const result = await run(["worktree", "list"]);
   return result.worktrees;
+}
+
+// Worktrees per repo id: every worktree Orca has on it, people's included. Worktree ids are
+// "<repoId>::<path>", the same shape worker.ts's baseWorktreeRef builds.
+export async function worktreeCountsByRepo(): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  for (const w of await worktreeList()) {
+    const repoId = w.id.split("::")[0];
+    counts.set(repoId, (counts.get(repoId) ?? 0) + 1);
+  }
+  return counts;
 }
 
 export async function worktreeRm(id: string): Promise<void> {

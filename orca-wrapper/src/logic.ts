@@ -177,3 +177,28 @@ export function isNotionUrl(url: string): boolean {
 export function renderPrompt(template: string, vars: Record<string, string>): string {
   return template.replace(/\{\{(\w+)\}\}/g, (match, key) => (Object.hasOwn(vars, key) ? vars[key] : match));
 }
+
+// Which configured repo (= agent host) a new session goes on: the connected one with the fewest
+// worktrees, ties to the earliest in `configured` so the choice is deterministic and a one-host
+// deployment never changes. `counts` is every worktree Orca has on the repo, people's own from
+// the Orca UI included: that is the real load on the host, which the wrapper's sessions alone
+// would understate. Null when no configured repo's host is connected.
+export function pickRepo(
+  configured: string[],
+  connected: Set<string>,
+  hostOf: Map<string, string>,
+  counts: Map<string, number>,
+): string | null {
+  let best: string | null = null;
+  let bestCount = Infinity;
+  for (const id of configured) {
+    const host = hostOf.get(id);
+    if (host === undefined || !connected.has(host)) continue;
+    const n = counts.get(id) ?? 0;
+    if (n < bestCount) {
+      best = id;
+      bestCount = n;
+    }
+  }
+  return best;
+}

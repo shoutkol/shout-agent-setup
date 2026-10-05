@@ -8,7 +8,7 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, stable, renderPrompt, shq } from "./logic.ts";
+import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, pickRepo, stable, renderPrompt, shq } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
 import { COMMENT_MAX_CHARS, looksCapped, matchesSnapshot, readFullAnswer, readTurnState, splitText } from "./answer.ts";
@@ -198,28 +198,51 @@ export function createWorker(handle: DatabaseSync) {
   // The worktreeId prefix for reaching the BASE checkout (not any worktree) via `orca terminal
   // create --worktree`, needed to run `git fetch` there before basing a throwaway branch on a ref
   // the base checkout hasn't seen yet.
-  async function baseWorktreeRef(): Promise<string> {
-    return `${config.repoId}::${await orca.repoPath()}`;
+  async function baseWorktreeRef(repoId: string): Promise<string> {
+    return `${repoId}::${await orca.repoPath(repoId)}`;
+  }
+
+  // A session row without repo_id predates multi-host placement, when every session lived on the
+  // one original host, which is listed first in ORCA_REPO_IDS.
+  function repoIdOf(session: db.Session): string {
+    return session.repo_id ?? config.repoIds[0];
+  }
+
+  // Placed once, when the worktree is created, and kept for the session's life: the worktree, the
+  // Claude transcript and downloaded attachments all live on that host and Orca can't move them.
+  // A failed checkout places again on the next job, which is fine: nothing was left behind.
+  async function placeSession(session: db.Session): Promise<string> {
+    const [connected, hostOf, counts] = await Promise.all([orca.hostsConnected(), orca.repoHosts(), orca.worktreeCountsByRepo()]);
+    const repoId = pickRepo(config.repoIds, connected, hostOf, counts);
+    if (!repoId) {
+      throw new Error(
+        "no agent host is reachable right now (Orca is not connected to any configured host). " +
+          "Nothing was started; ask again in a few minutes",
+      );
+    }
+    db.updateSession(handle, session.key, { repo_id: repoId });
+    return repoId;
   }
 
   // Fresh worktree, then get it onto the target branch. The automation is created separately,
   // once the first prompt (with any attachments staged, for kind 'pr') is known.
   async function ensureWorktree(session: db.Session): Promise<void> {
+    const repoId = await placeSession(session);
     if (session.kind === "pr") {
-      await ensurePrWorktree(session);
+      await ensurePrWorktree(session, repoId);
     } else {
-      await ensureTaskWorktree(session);
+      await ensureTaskWorktree(session, repoId);
     }
   }
 
-  async function ensurePrWorktree(session: db.Session): Promise<void> {
+  async function ensurePrWorktree(session: db.Session, repoId: string): Promise<void> {
     const headRef = session.head_ref!;
     // `worktree create --base-branch X` hands X straight to git in the BASE checkout, which only
     // knows branches it has fetched — a PR branch pushed after the clone's last fetch fails with
     // "invalid reference" (seen live on PR 482). So fetch it there first, then base the throwaway
     // worktree branch on origin/<head>, which is guaranteed to exist afterwards.
-    await runInWorktree(await baseWorktreeRef(), "fetch", `git fetch origin ${shq(headRef)}; exit`, session.key);
-    const worktreeId = await orca.worktreeCreate(session.key, `origin/${headRef}`);
+    await runInWorktree(await baseWorktreeRef(repoId), "fetch", `git fetch origin ${shq(headRef)}; exit`, session.key);
+    const worktreeId = await orca.worktreeCreate(session.key, `origin/${headRef}`, repoId);
 
     // Put the worktree on a local branch of our own that tracks origin/<head>, rather than on
     // <head> itself: git refuses to check out a branch that another worktree of the same clone
@@ -231,12 +254,12 @@ export function createWorker(handle: DatabaseSync) {
     await checkOutOrDiscard(session, worktreeId, checkoutCmd, local, `PR branch ${headRef}`);
   }
 
-  async function ensureTaskWorktree(session: db.Session): Promise<void> {
+  async function ensureTaskWorktree(session: db.Session, repoId: string): Promise<void> {
     const branch = session.head_ref!; // the WO's own branch, e.g. claude/WO-12-campaign-owner-credit
-    await runInWorktree(await baseWorktreeRef(), "fetch", `git fetch origin dev; exit`, session.key);
+    await runInWorktree(await baseWorktreeRef(repoId), "fetch", `git fetch origin dev; exit`, session.key);
     // `--name` is only a hint: Orca sanitises slashes and may add a user prefix (e.g. turns this
     // into `ziveso/claude-WO-12-x`), so its own branch is never the one we want.
-    const worktreeId = await orca.worktreeCreate(branch, "origin/dev");
+    const worktreeId = await orca.worktreeCreate(branch, "origin/dev", repoId);
 
     // One work order, one branch, one PR: when the branch is already on origin (the WO was
     // dispatched before), carry on from it; otherwise create it off origin/dev and push it right
@@ -621,7 +644,7 @@ export function createWorker(handle: DatabaseSync) {
       if (saved && session.kind === "pr") {
         // Our per-session branch (see localBranchFor) outlives the worktree otherwise.
         const local = shq(localBranchFor(session));
-        await runInWorktree(await baseWorktreeRef(), "cleanup", `git branch -D ${local}; exit`, session.key).catch((err) =>
+        await runInWorktree(await baseWorktreeRef(repoIdOf(session)), "cleanup", `git branch -D ${local}; exit`, session.key).catch((err) =>
           console.log(`branch cleanup failed key=${session.key}: ${err}`),
         );
       }

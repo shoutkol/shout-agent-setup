@@ -25,7 +25,8 @@ Read once at startup in `src/config.ts`.
 | Var | Required | Default | Meaning |
 |---|---|---|---|
 | `ORCA_WRAPPER_TOKEN` | yes | — | Static bearer token every request must present. |
-| `ORCA_REPO_ID` | yes | — | Orca repo id of `shoutkol/shout`. |
+| `ORCA_REPO_IDS` | yes (or `ORCA_REPO_ID`) | — | Comma-separated Orca repo ids of `shoutkol/shout`, one per agent host (the same repo registered on two SSH targets is two ids; see `orca repo list`). A new session is placed on the connected host with the fewest worktrees, ties to the id listed first, so list the original host first. See [Multiple agent hosts](#multiple-agent-hosts). |
+| `ORCA_REPO_ID` | no | — | Single-host fallback: used as the only id when `ORCA_REPO_IDS` is unset. |
 | `ORCA_BIN` | no | `${HOME}/.local/bin/orca` | Path to the `orca` CLI launcher. |
 | `GITHUB_REPO` | no | `shoutkol/shout` | `owner/name` to post comments/reactions to. |
 | `GITHUB_TOKEN` | no | — | If unset, fetched once via `gh auth token`. |
@@ -91,11 +92,26 @@ properties) so that stripping is a no-op transform, not a compile.
    transcript falls back to the snapshot.
 4. **`automations remove` does not close its terminal.** Closing a session removes the automation,
    then separately lists and closes every terminal in the worktree, then removes the worktree —
-   each step logged and attempted independently so one failure doesn't skip the rest.
+   each step logged and attempted independently so one failure doesn't skip the rest. All of it
+   goes through the session's own `worktree_id`, which Orca resolves to the right host; only the
+   per-PR branch cleanup runs in a base checkout, the one on the session's host (`repo_id`).
    Before removing the worktree, the worker commits anything uncommitted or unpushed and pushes it
    to `orca-wip/<session key>`; if that save doesn't finish, the worktree is left on disk and the
    session is still closed, so a close never deletes work. The hourly idle sweep also closes any open
    session whose PR is closed on GitHub, for a close webhook that was missed.
+
+## Multiple agent hosts
+
+`ORCA_REPO_IDS` lists one Orca repo id per agent host. When a session first needs a worktree the
+worker picks the id whose host is connected (`orca host list`) and has the fewest worktrees
+(`pickRepo` in `src/logic.ts`), ties to the id listed first, and stores it on the session
+(`sessions.repo_id`). The count is every worktree Orca has on that repo, including the ones people
+open from the Orca UI: that is the real load on the host, which the wrapper's own sessions would
+understate. Placement happens once and is permanent: the worktree, the Claude transcript and the
+downloaded attachments all live on that host, and Orca can't move a worktree between hosts. A
+disconnected host is skipped; if none is connected the job fails with a "no agent host is
+reachable" comment. A session row with no `repo_id` predates this and is treated as the first
+configured id.
 
 ## Long answers
 

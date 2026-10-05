@@ -3,7 +3,8 @@
 # within the wrapper's timeout: every git plumbing terminal exits at once, the worktree lands on
 # the task's branch, and the automation run stays "dispatched" forever.
 case "$*" in
-  *"repo list"*) echo '{"ok":true,"result":{"repos":[{"id":"r","path":"/srv/base"}]}}' ;;
+  *"repo list"*) echo '{"ok":true,"result":{"repos":[{"id":"r","path":"/srv/base","executionHostId":"ssh:ssh-1"}]}}' ;;
+  *"host list"*) echo '{"ok":true,"result":{"hosts":[{"kind":"ssh","id":"ssh-1","connected":true}]}}' ;;
   *"worktree create"*) echo '{"ok":true,"result":{"worktree":{"id":"wt1"}}}' ;;
   *"worktree list"*) echo '{"ok":true,"result":{"worktrees":[{"id":"wt1","branch":"refs/heads/claude/WO-444-seeding"}]}}' ;;
   *"terminal create"*) echo '{"ok":true,"result":{"terminal":{"handle":"th1"}}}' ;;

@@ -28,7 +28,7 @@ export async function health(handle: DatabaseSync): Promise<Record<string, unkno
   const commit = await git("rev-parse", "--short", "HEAD").catch((err) => `unknown (${err?.message ?? err})`);
   let orcaStatus: string;
   try {
-    await orca.repoPath(); // `orca repo list` — fails fast when the Orca app isn't running
+    await orca.repoHosts(); // `orca repo list` — fails fast when the Orca app isn't running
     orcaStatus = "ok";
   } catch (err: any) {
     orcaStatus = err?.message ?? String(err);
