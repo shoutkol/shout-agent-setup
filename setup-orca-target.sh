@@ -199,9 +199,11 @@ log "6/7  Memory guards (earlyoom + claude-reaper)"
 # earlyoom: kill the single largest process (usually a 2 GB `tsc`) when
 # available RAM < 10% AND swap is > 10% used, instead of swapping to death.
 # No `--prefer node`: Orca's relay is a small `node relay.js` process.
+# The regex is unquoted on purpose: systemd splits $EARLYOOM_ARGS at
+# whitespace and inner quotes would end up inside the pattern.
 sudo apt-get install -y -qq earlyoom
 sudo tee /etc/default/earlyoom >/dev/null <<'CONF'
-EARLYOOM_ARGS="-m 10 -s 90 -r 3600 --avoid '^(sshd|systemd|systemd-journal|systemd-logind)$'"
+EARLYOOM_ARGS="-m 10 -s 90 -r 3600 --avoid ^(sshd|systemd|systemd-journal|systemd-logind)$"
 CONF
 sudo systemctl enable earlyoom
 sudo systemctl restart earlyoom
@@ -247,13 +249,17 @@ for pid in $(pgrep -u "$(id -u)" -x claude || true); do
 
   pgid="$(ps -o pgid= -p "$pid" | tr -d ' ' || true)"
   ppid="$(ps -o ppid= -p "$pid" | tr -d ' ' || true)"
-  echo "claude-reaper: pid=$pid idle=${idle_h}h (limit ${limit}h) cwd=$cwd${DRY_RUN:+ [dry run]}"
-  [[ -n "${DRY_RUN:-}" ]] && continue
+  dry=""; [[ "${DRY_RUN:-0}" == 1 ]] && dry=" [dry run]"
+  echo "claude-reaper: pid=$pid idle=${idle_h}h (limit ${limit}h) cwd=$cwd$dry"
+  [[ -n "$dry" ]] && continue
   # Whole group (takes its tsc/MCP children too), then the parent shell so the
-  # Orca tab exits and Orca does not reuse it.
+  # Orca tab exits and Orca does not reuse it. Only a shell gets the HUP: if
+  # Orca ever spawned claude straight from its relay, HUP would drop the relay.
   if [[ -n "$pgid" ]] && (( pgid > 1 )); then
     kill -TERM -- "-$pgid" 2>/dev/null || true
-    [[ -n "$ppid" ]] && kill -HUP "$ppid" 2>/dev/null || true
+    case "$(ps -o comm= -p "$ppid" 2>/dev/null || true)" in
+      bash|sh|dash|zsh) kill -HUP "$ppid" 2>/dev/null || true ;;
+    esac
   fi
 done
 REAPER
