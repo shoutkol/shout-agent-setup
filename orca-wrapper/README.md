@@ -32,7 +32,7 @@ Read once at startup in `src/config.ts`.
 | `GITHUB_DRY_RUN` | no | unset | `1` logs GitHub calls instead of making them (local smoke tests). |
 | `PORT` | no | `8787` | Bound to `127.0.0.1` only — Caddy fronts it. |
 | `DB_PATH` | no | `${HOME}/.local/share/orca-wrapper/state.sqlite` | SQLite file (dir is created if missing). |
-| `IDLE_DAYS` | no | `15` | Sessions idle this long are closed by the hourly sweep. |
+| `IDLE_DAYS` | no | `3` | Sessions idle this long are closed by the hourly sweep, which also closes any open session whose PR is closed on GitHub (a missed webhook). |
 | `RUN_TIMEOUT_MIN` | no | `60` | Max time to wait for one automation run to finish. |
 | `BUSY_WAIT_MIN` | no | `10` | Before a session's next run, max time to wait for its agent terminal to go idle (a timed-out or pre-restart run may still be going). Past it, the job fails with a note instead of running on top. |
 
@@ -92,6 +92,10 @@ properties) so that stripping is a no-op transform, not a compile.
 4. **`automations remove` does not close its terminal.** Closing a session removes the automation,
    then separately lists and closes every terminal in the worktree, then removes the worktree —
    each step logged and attempted independently so one failure doesn't skip the rest.
+   Before removing the worktree, the worker commits anything uncommitted or unpushed and pushes it
+   to `orca-wip/<session key>`; if that save doesn't finish, the worktree is left on disk and the
+   session is still closed, so a close never deletes work. The hourly idle sweep also closes any open
+   session whose PR is closed on GitHub, for a close webhook that was missed.
 
 ## Long answers
 

@@ -17,6 +17,9 @@
 #      --git-name NAME      git user.name       (default: keep existing)
 #      --git-email EMAIL    git user.email      (default: keep existing)
 #      --key NAME           ssh key filename    (default: github)
+#
+#  Also installs earlyoom and an hourly claude-reaper timer so idle sessions
+#  and runaway tsc runs cannot swap the host to death.
 # =============================================================================
 set -euo pipefail
 
@@ -41,7 +44,7 @@ while [[ $# -gt 0 ]]; do
     --git-name)  GIT_NAME="$2";  shift 2 ;;
     --git-email) GIT_EMAIL="$2"; shift 2 ;;
     --key)       KEY_NAME="$2";  shift 2 ;;
-    -h|--help)   sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help)   sed -n "2,23p" "$0"; exit 0 ;;
     *) echo "!! Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -59,7 +62,7 @@ export NEEDRESTART_MODE=a
 export NEEDRESTART_SUSPEND=1
 
 # -----------------------------------------------------------------------------
-log "1/6  Host requirements (git + build toolchain)"
+log "1/7  Host requirements (git + build toolchain)"
 # -----------------------------------------------------------------------------
 # git      -> Orca runs `git worktree add` over SSH
 # make/g++ -> node-pty builds here; without them Orca still connects for files,
@@ -70,7 +73,7 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq git build-essential python3 curl rsync ca-certificates gnupg
 
 # -----------------------------------------------------------------------------
-log "2/6  Node.js 22 (system-wide)"
+log "2/7  Node.js 22 (system-wide)"
 # -----------------------------------------------------------------------------
 # System-wide on purpose. Orca launches agents over NON-INTERACTIVE ssh, which
 # does not source ~/.bashrc -- so nvm/fnm-managed node is invisible there and
@@ -114,7 +117,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "3/6  Git identity"
+log "3/7  Git identity"
 # -----------------------------------------------------------------------------
 # Commits are authored by whoever this host says it is -- set it to the agent
 # account, not your personal one, or every agent commit lands under your name.
@@ -131,7 +134,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "4/6  GitHub SSH key for this host"
+log "4/7  GitHub SSH key for this host"
 # -----------------------------------------------------------------------------
 # The host pushes on its own key, not through agent-forwarding: forwarded
 # agents die when your laptop sleeps, which is exactly the case Orca exists to
@@ -172,7 +175,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "5/6  Claude Code authentication"
+log "5/7  Claude Code authentication"
 # -----------------------------------------------------------------------------
 # Claude DESKTOP being signed in does not authenticate the Claude CODE CLI --
 # they keep separate credentials. Orca launches the CLI.
@@ -187,7 +190,114 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "6/6  Repository"
+log "6/7  Memory guards (earlyoom + claude-reaper)"
+# -----------------------------------------------------------------------------
+# Every Orca terminal tab keeps a `claude` TUI alive (~250 MB each) for days, and
+# agents' `tsc` runs add ~2 GB apiece. Without a guard the box swaps until
+# Orca's SSH relay times out and the host is unreachable.
+#
+# earlyoom: kill the single largest process (usually a 2 GB `tsc`) when
+# available RAM < 10% AND swap is > 10% used, instead of swapping to death.
+# No `--prefer node`: Orca's relay is a small `node relay.js` process.
+# The regex is unquoted on purpose: systemd splits $EARLYOOM_ARGS at
+# whitespace and inner quotes would end up inside the pattern.
+sudo apt-get install -y -qq earlyoom
+sudo tee /etc/default/earlyoom >/dev/null <<'CONF'
+EARLYOOM_ARGS="-m 10 -s 90 -r 3600 --avoid ^(sshd|systemd|systemd-journal|systemd-logind)$"
+CONF
+sudo systemctl enable earlyoom
+sudo systemctl restart earlyoom
+
+# claude-reaper: hourly, closes `claude` sessions nobody has typed into for days.
+sudo tee /usr/local/bin/claude-reaper >/dev/null <<'REAPER'
+#!/usr/bin/env bash
+# Close idle `claude` TUI sessions (and their Orca terminal tab) of this user.
+#
+# "Idle" = now - ATIME of the session's pty (/dev/pts/N), i.e. the last INPUT
+# (what `w` shows as IDLE). CPU time and pty mtime cannot be used: an idle
+# Claude Code TUI still burns 2-5% CPU and its pty mtime updates every second.
+#
+# Nothing is lost: the transcript stays on disk, so `claude --resume` in the
+# same worktree recovers the conversation.
+#
+# Not a durable close: Orca keeps the tab's resume record, and when that Orca
+# reconnects it reopens the tab with `claude --resume <id>` (seen 2026-10-05:
+# 5 of 18 came back). This frees RAM until then; closing for good is Orca's
+# `terminal close` or Sleep, from the Orca that owns the tab.
+#
+# Limits (hours, env-overridable):
+#   WRAPPER_IDLE_H=96  orca-wrapper worktrees (repo-pr-<n>, repo-claude-WO-*);
+#                      it closes its own sessions after 3 days, this only
+#                      catches ones it lost track of
+#   PEOPLE_IDLE_H=24   everything else (people's Orca worktrees)
+# DRY_RUN=1 only logs what would be closed.
+set -euo pipefail
+
+WRAPPER_IDLE_H="${WRAPPER_IDLE_H:-96}"
+PEOPLE_IDLE_H="${PEOPLE_IDLE_H:-24}"
+now="$(date +%s)"
+
+for pid in $(pgrep -u "$(id -u)" -x claude || true); do
+  tty="$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  [[ -z "$tty" || "$tty" == "?" ]] && continue
+  cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+  [[ -z "$cwd" ]] && continue
+  atime="$(stat -c %X "/dev/$tty" 2>/dev/null || true)"
+  [[ -z "$atime" ]] && continue
+  idle_h=$(( (now - atime) / 3600 ))
+
+  case "$(basename "$cwd")" in
+    repo-pr-[0-9]*|repo-claude-WO-*) limit="$WRAPPER_IDLE_H" ;;
+    *)                               limit="$PEOPLE_IDLE_H" ;;
+  esac
+  (( idle_h >= limit )) || continue
+
+  pgid="$(ps -o pgid= -p "$pid" | tr -d ' ' || true)"
+  ppid="$(ps -o ppid= -p "$pid" | tr -d ' ' || true)"
+  dry=""; [[ "${DRY_RUN:-0}" == 1 ]] && dry=" [dry run]"
+  echo "claude-reaper: pid=$pid idle=${idle_h}h (limit ${limit}h) cwd=$cwd$dry"
+  [[ -n "$dry" ]] && continue
+  # Whole group (takes its tsc/MCP children too), then the parent shell so the
+  # Orca tab exits instead of sitting at a bare prompt. Only a shell gets the HUP: if
+  # Orca ever spawned claude straight from its relay, HUP would drop the relay.
+  if [[ -n "$pgid" ]] && (( pgid > 1 )); then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    case "$(ps -o comm= -p "$ppid" 2>/dev/null || true)" in
+      bash|sh|dash|zsh) kill -HUP "$ppid" 2>/dev/null || true ;;
+    esac
+  fi
+done
+REAPER
+sudo chmod 755 /usr/local/bin/claude-reaper
+
+sudo tee /etc/systemd/system/claude-reaper.service >/dev/null <<UNIT
+[Unit]
+Description=Close idle claude sessions
+
+[Service]
+Type=oneshot
+User=$USER_NAME
+ExecStart=/usr/local/bin/claude-reaper
+UNIT
+
+sudo tee /etc/systemd/system/claude-reaper.timer >/dev/null <<'UNIT'
+[Unit]
+Description=Hourly idle claude session reaper
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now claude-reaper.timer
+echo "   earlyoom active; claude-reaper runs hourly (DRY_RUN=1 /usr/local/bin/claude-reaper to preview)"
+
+# -----------------------------------------------------------------------------
+log "7/7  Repository"
 # -----------------------------------------------------------------------------
 if [[ -n "$REPO" ]]; then
   [[ -z "$DEST" ]] && DEST="$HOME/${REPO##*/}"
@@ -213,6 +323,7 @@ cat <<BANNER
   user      $USER_NAME
   host      $(hostname -s)  ($IP)
   repo      $DEST
+  guards    earlyoom (OOM) + claude-reaper.timer (hourly idle-session close)
 
   ---------------------------------------------------------------------------
   NOW ON YOUR LAPTOP
