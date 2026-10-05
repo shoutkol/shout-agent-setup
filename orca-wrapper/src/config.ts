@@ -39,7 +39,7 @@ export const config = {
   githubDryRun,
   port: Number(process.env.PORT ?? 8787),
   dbPath,
-  idleDays: Number(process.env.IDLE_DAYS ?? 15),
+  idleDays: Number(process.env.IDLE_DAYS ?? 3),
   runTimeoutMin: Number(process.env.RUN_TIMEOUT_MIN ?? 60),
   busyWaitMin: Number(process.env.BUSY_WAIT_MIN ?? 10),
 };

@@ -289,6 +289,17 @@ export function createWorker(handle: DatabaseSync) {
     }
   }
 
+  // Shell command that commits and pushes whatever the worktree holds that origin lacks, to
+  // orca-wip/<key>, and exits only on success (see teardown). Hooks are skipped: this must not fail.
+  function saveCommand(key: string): string {
+    const msg = shq(`wip: orca session ${key} closed with unsaved work`);
+    const ref = shq(`HEAD:refs/heads/orca-wip/${key}`);
+    return (
+      `if [ -n "$(git status --porcelain)" ] || [ -n "$(git log @{u}.. --oneline 2>/dev/null)" ]; then ` +
+      `git add -A && git commit -q --no-verify -m ${msg}; git push -q --no-verify origin ${ref}; fi && exit`
+    );
+  }
+
   // Images in the comment: resolve each GitHub attachment URL to its short-lived signed URL
   // (needs our token), download them on the agent host via a one-shot terminal, and point the
   // prompt at the local files. A failed attachment is logged and left as a URL, not fatal.
@@ -596,8 +607,18 @@ export function createWorker(handle: DatabaseSync) {
       } catch (err) {
         console.log(`terminalList failed key=${session.key}: ${err}`);
       }
-      await orca.worktreeRm(session.worktree_id).catch((err) => console.log(`worktreeRm failed key=${session.key}: ${err}`));
-      if (session.kind === "pr") {
+      // Save unsaved work first so closing never deletes it: the shell only exits when there was
+      // nothing to save or the commit+push to orca-wip/<key> succeeded. If it didn't, leave the
+      // worktree (and its branch) on disk.
+      const saved = await runInWorktree(session.worktree_id, "save", saveCommand(session.key), session.key).catch((err) => {
+        console.log(`save failed key=${session.key}: ${err}`);
+        return false;
+      });
+      if (!saved) console.log(`unsaved work not pushed, keeping worktree key=${session.key} worktree=${session.worktree_id}`);
+      if (saved) {
+        await orca.worktreeRm(session.worktree_id).catch((err) => console.log(`worktreeRm failed key=${session.key}: ${err}`));
+      }
+      if (saved && session.kind === "pr") {
         // Our per-session branch (see localBranchFor) outlives the worktree otherwise.
         const local = shq(localBranchFor(session));
         await runInWorktree(await baseWorktreeRef(), "cleanup", `git branch -D ${local}; exit`, session.key).catch((err) =>
@@ -608,10 +629,20 @@ export function createWorker(handle: DatabaseSync) {
     db.closeSessionRow(handle, session.key);
   }
 
+  // Closes idle sessions, and any open session whose PR is closed on GitHub — the webhook-driven
+  // close (server.ts) can be missed, and PR #649 stayed open in the DB that way.
   async function sweepIdle(): Promise<void> {
     const cutoff = Date.now() - config.idleDays * 24 * 60 * 60 * 1000;
     for (const key of db.idleSessions(handle, cutoff)) {
       await closeSession(key).catch((err) => console.log(`idle sweep close failed key=${key}: ${err}`));
+    }
+    for (const session of db.listOpenSessions(handle)) {
+      if (session.pr === null) continue;
+      try {
+        if ((await github.pullState(session.pr)) === "closed") await closeSession(session.key);
+      } catch (err) {
+        console.log(`closed-PR sweep failed key=${session.key}: ${err}`);
+      }
     }
   }
 
