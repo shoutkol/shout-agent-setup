@@ -8,7 +8,7 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, pickRepo, stable, renderPrompt, shq } from "./logic.ts";
+import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, pickRepo, stable, renderPrompt, shq, TURN_STATE_MAX_FAILURES } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
 import { COMMENT_MAX_CHARS, looksCapped, matchesSnapshot, readFullAnswer, readTurnState, splitText } from "./answer.ts";
@@ -23,7 +23,8 @@ const DOWNLOAD_MAX_MS = 60_000;
 // its agent to go idle: a run the wrapper gave up on (timeout) or lost track of (restart) is often
 // still going, and a second `automations run` on top of it forks the session.
 const AGENT_IDLE_POLL_MS = 10_000;
-// While background sub-agents are still running, how often to re-read the transcript.
+// While background sub-agents are still running, or the transcript couldn't be read, how often to
+// re-read it.
 const TURN_STATE_RECHECK_MS = 15_000;
 
 const NOTION_UPDATE_KIND = "notion-update";
@@ -402,6 +403,7 @@ export function createWorker(handle: DatabaseSync) {
     let terminalHandle: string | undefined;
     let prevCapturedAt: string | null = null;
     let nextTurnStateAt = 0;
+    let failedTurnStateReads = 0; // in a row, see logic.backgroundVerdict
 
     while (Date.now() < deadline) {
       const runs = await orca.automationRuns(session.automation_id!);
@@ -439,10 +441,18 @@ export function createWorker(handle: DatabaseSync) {
           console.log(`turn state read failed key=${session.key}: ${err}`);
           return null;
         });
-        const verdict = backgroundVerdict(state);
+        failedTurnStateReads = state === null ? failedTurnStateReads + 1 : 0;
+        const verdict = backgroundVerdict(state, failedTurnStateReads);
         if (verdict === "transcript") return { outcome: "done", content: state!.answer, truncated: false, fromTranscript: true };
-        if (verdict === "snapshot") return { outcome: "done", content: snap!.content, truncated: snap!.truncated };
-        console.log(`key=${session.key}: turn ended with ${state!.pending} background agent(s) still running, waiting`);
+        if (verdict === "snapshot") {
+          if (state === null) console.log(`key=${session.key}: transcript unreadable ${failedTurnStateReads} times in a row, taking the snapshot`);
+          return { outcome: "done", content: snap!.content, truncated: snap!.truncated };
+        }
+        if (verdict === "retry") {
+          console.log(`key=${session.key}: transcript unreadable (${failedTurnStateReads}/${TURN_STATE_MAX_FAILURES}), reading it again`);
+        } else {
+          console.log(`key=${session.key}: turn ended with ${state!.pending} background agent(s) still running, waiting`);
+        }
         nextTurnStateAt = Date.now() + TURN_STATE_RECHECK_MS;
       }
       prevCapturedAt = capturedAt;

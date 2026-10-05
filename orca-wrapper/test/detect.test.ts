@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, stable } from "../src/logic.ts";
+import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, stable, TURN_STATE_MAX_FAILURES } from "../src/logic.ts";
 import { readFileSync } from "node:fs";
 
 test("fresh session: early completed but not idle -> pending", () => {
@@ -117,7 +117,17 @@ test("backgroundVerdict: once sub-agents are done, the transcript's answer beats
   assert.strictEqual(backgroundVerdict({ pending: 0, background: true, answer: "  " }), "snapshot");
 });
 
-test("backgroundVerdict: no sub-agents, or an unreadable transcript -> the snapshot, as before", () => {
+test("backgroundVerdict: no sub-agents -> the snapshot, as before", () => {
   assert.strictEqual(backgroundVerdict({ pending: 0, background: false, answer: "done" }), "snapshot");
-  assert.strictEqual(backgroundVerdict(null), "snapshot");
+});
+
+// wo-475: one unread transcript let "I'll wait for the spec review" through as the answer, before
+// the agent pushed, so no PR was opened.
+test("backgroundVerdict: an unreadable transcript is read again, not taken as done", () => {
+  assert.strictEqual(backgroundVerdict(null, 1), "retry");
+  assert.strictEqual(backgroundVerdict(null, TURN_STATE_MAX_FAILURES - 1), "retry");
+});
+
+test("backgroundVerdict: still unreadable after the cap -> the snapshot", () => {
+  assert.strictEqual(backgroundVerdict(null, TURN_STATE_MAX_FAILURES), "snapshot");
 });

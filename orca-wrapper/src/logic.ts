@@ -69,7 +69,9 @@ export interface TurnState {
   answer: string;
 }
 
-export type BackgroundVerdict = "wait" | "transcript" | "snapshot";
+export type BackgroundVerdict = "wait" | "retry" | "transcript" | "snapshot";
+
+export const TURN_STATE_MAX_FAILURES = 3;
 
 // A turn ending is not the work ending. An agent that fans out to background sub-agents
 // (`/code-review` does) ends its turn at once with "waiting for the reviewers", and every signal
@@ -79,9 +81,14 @@ export type BackgroundVerdict = "wait" | "transcript" | "snapshot";
 //   transcript — sub-agents ran and are done; take the answer from the transcript, because the
 //                snapshot can still show an earlier turn (PR 491: the post was turn 2's "waiting"
 //                although turn 3's report was already on disk).
-//   snapshot   — no sub-agents, or the transcript couldn't be read: the snapshot, as before.
-export function backgroundVerdict(state: TurnState | null): BackgroundVerdict {
-  if (state === null) return "snapshot";
+//   retry      — the transcript couldn't be read; read it again rather than trust the snapshot.
+//                One unread transcript let wo-475's "I'll wait for the spec review" turn through
+//                as the answer, 6 min before the agent pushed, so its PR was never opened.
+//   snapshot   — no sub-agents, or the transcript stayed unreadable TURN_STATE_MAX_FAILURES
+//                reads in a row: the snapshot, as before.
+// `failedReads` counts the unreadable reads in a row, this one included.
+export function backgroundVerdict(state: TurnState | null, failedReads = 0): BackgroundVerdict {
+  if (state === null) return failedReads < TURN_STATE_MAX_FAILURES ? "retry" : "snapshot";
   if (state.pending > 0) return "wait";
   if (state.background && state.answer.trim()) return "transcript";
   return "snapshot";
