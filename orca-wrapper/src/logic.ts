@@ -178,11 +178,16 @@ export function renderPrompt(template: string, vars: Record<string, string>): st
   return template.replace(/\{\{(\w+)\}\}/g, (match, key) => (Object.hasOwn(vars, key) ? vars[key] : match));
 }
 
-// Which configured repo (= agent host) a new session goes on: the connected one with the fewest
-// worktrees, ties to the earliest in `configured` so the choice is deterministic and a one-host
-// deployment never changes. `counts` is every worktree Orca has on the repo, people's own from
-// the Orca UI included: that is the real load on the host, which the wrapper's sessions alone
-// would understate. Null when no configured repo's host is connected.
+// Which configured repo (= agent host) a new session goes on: the connected one carrying the
+// fewest of the wrapper's open sessions, ties to the earliest in `configured` so the choice is
+// deterministic and a one-host deployment never changes. Null when no configured repo's host is
+// connected.
+//
+// `counts` comes from the wrapper's own database, not from Orca. `orca worktree list` would be
+// the better signal — it would count the sessions people opened themselves, which are real load
+// on a shared host — but on the GCE desktop it reports only each repo's main checkout: 2 rows
+// (1 per host, at any --limit) while the droplet held 9 worktrees (verified 2026-10-05). Both
+// hosts would always tie and every session would land on the first one.
 export function pickRepo(
   configured: string[],
   connected: Set<string>,

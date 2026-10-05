@@ -164,6 +164,16 @@ export function listOpenSessions(db: DatabaseSync): Session[] {
   return db.prepare("SELECT * FROM sessions WHERE state != 'closed'").all() as unknown as Session[];
 }
 
+// Open sessions per repo id — the wrapper's own load on each agent host, used to place the next
+// session (see logic.pickRepo). Rows from before multi-host placement have repo_id NULL and come
+// back under the null key; the caller folds them into its first configured id.
+export function openSessionCountsByRepo(db: DatabaseSync): Map<string | null, number> {
+  const rows = db
+    .prepare("SELECT repo_id, COUNT(*) AS n FROM sessions WHERE state != 'closed' GROUP BY repo_id")
+    .all() as Array<{ repo_id: string | null; n: number }>;
+  return new Map(rows.map((r) => [r.repo_id, Number(r.n)]));
+}
+
 // Called when a prompt comes in for a PR. If the PR already has a live (non-closed) session —
 // including one opened from a task work order, once the wrapper has recorded its PR number — that
 // row is reused, not duplicated: only head_ref may need updating (the workflow resends it on

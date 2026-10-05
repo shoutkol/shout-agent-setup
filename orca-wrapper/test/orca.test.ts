@@ -38,7 +38,3 @@ test("repoHosts maps each repo id to its execution host", async () => {
 test("hostsConnected returns only connected hosts, in repoHosts' id form", async () => {
   assert.deepStrictEqual([...(await orca.hostsConnected())].sort(), ["local", "ssh:ssh-1"]);
 });
-
-test("worktreeCountsByRepo counts every worktree per repo id", async () => {
-  assert.deepStrictEqual([...(await orca.worktreeCountsByRepo())], [["r", 2], ["r2", 1]]);
-});

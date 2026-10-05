@@ -109,17 +109,6 @@ export async function worktreeList(): Promise<Array<{ id: string; branch: string
   return result.worktrees;
 }
 
-// Worktrees per repo id: every worktree Orca has on it, people's included. Worktree ids are
-// "<repoId>::<path>", the same shape worker.ts's baseWorktreeRef builds.
-export async function worktreeCountsByRepo(): Promise<Map<string, number>> {
-  const counts = new Map<string, number>();
-  for (const w of await worktreeList()) {
-    const repoId = w.id.split("::")[0];
-    counts.set(repoId, (counts.get(repoId) ?? 0) + 1);
-  }
-  return counts;
-}
-
 export async function worktreeRm(id: string): Promise<void> {
   await run(["worktree", "rm", "--worktree", `id:${id}`]);
 }

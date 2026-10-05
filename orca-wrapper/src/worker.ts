@@ -212,7 +212,14 @@ export function createWorker(handle: DatabaseSync) {
   // Claude transcript and downloaded attachments all live on that host and Orca can't move them.
   // A failed checkout places again on the next job, which is fine: nothing was left behind.
   async function placeSession(session: db.Session): Promise<string> {
-    const [connected, hostOf, counts] = await Promise.all([orca.hostsConnected(), orca.repoHosts(), orca.worktreeCountsByRepo()]);
+    const [connected, hostOf] = await Promise.all([orca.hostsConnected(), orca.repoHosts()]);
+    // Sessions placed before this host existed (repo_id NULL) all live on the first configured
+    // id, so they count towards it — otherwise the original host would look empty and win forever.
+    const counts = new Map<string, number>();
+    for (const [repoId, n] of db.openSessionCountsByRepo(handle)) {
+      const id = repoId ?? config.repoIds[0];
+      counts.set(id, (counts.get(id) ?? 0) + n);
+    }
     const repoId = pickRepo(config.repoIds, connected, hostOf, counts);
     if (!repoId) {
       throw new Error(

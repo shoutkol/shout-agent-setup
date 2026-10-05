@@ -20,6 +20,8 @@ import {
   findActiveDuplicate,
   markJobDone,
   getLastOutput,
+  openSessionCountsByRepo,
+  closeSessionRow,
 } from "../src/db.ts";
 
 test("two queued jobs for one PR session: only one can be claimed as running", () => {
@@ -233,5 +235,21 @@ test("getLastOutput is the agent's answer, not the Notion-writeback job's reply"
   enqueueJob(db, taskKey(10), null, "orca", "update notion", "notion-update");
   markJobDone(db, claimNextJob(db, taskKey(10))!.id, "updated PR, Stage");
   assert.strictEqual(getLastOutput(db, taskKey(10)), "the real answer");
+  db.close();
+});
+
+// Placement's load signal (see logic.pickRepo): sessions still open, per host, with the
+// pre-multi-host rows under the null key for the caller to fold into its first configured id.
+test("openSessionCountsByRepo counts open sessions per repo id, closed ones excluded", () => {
+  const db = openDb(":memory:");
+  ensurePrSession(db, 20, "a");
+  updateSession(db, "pr-20", { repo_id: "r2" });
+  ensurePrSession(db, 21, "b");
+  updateSession(db, "pr-21", { repo_id: "r2" });
+  ensurePrSession(db, 22, "c"); // never placed: predates multi-host
+  ensurePrSession(db, 23, "d");
+  updateSession(db, "pr-23", { repo_id: "r" });
+  closeSessionRow(db, "pr-23");
+  assert.deepStrictEqual([...openSessionCountsByRepo(db)].sort(), [[null, 1], ["r2", 2]]);
   db.close();
 });

@@ -25,7 +25,7 @@ Read once at startup in `src/config.ts`.
 | Var | Required | Default | Meaning |
 |---|---|---|---|
 | `ORCA_WRAPPER_TOKEN` | yes | — | Static bearer token every request must present. |
-| `ORCA_REPO_IDS` | yes (or `ORCA_REPO_ID`) | — | Comma-separated Orca repo ids of `shoutkol/shout`, one per agent host (the same repo registered on two SSH targets is two ids; see `orca repo list`). A new session is placed on the connected host with the fewest worktrees, ties to the id listed first, so list the original host first. See [Multiple agent hosts](#multiple-agent-hosts). |
+| `ORCA_REPO_IDS` | yes (or `ORCA_REPO_ID`) | — | Comma-separated Orca repo ids of `shoutkol/shout`, one per agent host (the same repo registered on two SSH targets is two ids; see `orca repo list`). A new session is placed on the connected host carrying the fewest of the wrapper's open sessions, ties to the id listed first, so list the original host first. See [Multiple agent hosts](#multiple-agent-hosts). |
 | `ORCA_REPO_ID` | no | — | Single-host fallback: used as the only id when `ORCA_REPO_IDS` is unset. |
 | `ORCA_BIN` | no | `${HOME}/.local/bin/orca` | Path to the `orca` CLI launcher. |
 | `GITHUB_REPO` | no | `shoutkol/shout` | `owner/name` to post comments/reactions to. |
@@ -103,15 +103,19 @@ properties) so that stripping is a no-op transform, not a compile.
 ## Multiple agent hosts
 
 `ORCA_REPO_IDS` lists one Orca repo id per agent host. When a session first needs a worktree the
-worker picks the id whose host is connected (`orca host list`) and has the fewest worktrees
-(`pickRepo` in `src/logic.ts`), ties to the id listed first, and stores it on the session
-(`sessions.repo_id`). The count is every worktree Orca has on that repo, including the ones people
-open from the Orca UI: that is the real load on the host, which the wrapper's own sessions would
-understate. Placement happens once and is permanent: the worktree, the Claude transcript and the
-downloaded attachments all live on that host, and Orca can't move a worktree between hosts. A
-disconnected host is skipped; if none is connected the job fails with a "no agent host is
-reachable" comment. A session row with no `repo_id` predates this and is treated as the first
-configured id.
+worker picks the id whose host is connected (`orca host list`) and carries the fewest of the
+wrapper's open sessions (`pickRepo` in `src/logic.ts`), ties to the id listed first, and stores it
+on the session (`sessions.repo_id`). Placement happens once and is permanent: the worktree, the
+Claude transcript and the downloaded attachments all live on that host, and Orca can't move a
+worktree between hosts. A disconnected host is skipped; if none is connected the job fails with a
+"no agent host is reachable" comment. A session row with no `repo_id` predates this and is treated
+as the first configured id, which is where those sessions actually live.
+
+The count comes from the wrapper's own `sessions` table, so it does not see the sessions people
+open themselves — real load on a shared host. `orca worktree list` would, but on the GCE desktop
+it answers with each repo's main checkout only: 2 rows, 1 per host, at any `--limit`, while the
+droplet held 9 worktrees (checked 2026-10-05). Every host would tie and the first would take every
+session. If the hosts drift far apart in practice, that is the thing to fix.
 
 ## Long answers
 
