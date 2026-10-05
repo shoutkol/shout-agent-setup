@@ -55,6 +55,8 @@ test("teardown saves unsaved work first, and keeps the worktree when the save do
     await createWorker(handle).closeSession(savedKey);
     assert.match(calls(), /--command if \[ -n .*orca-wip\/pr-651/);
     assert.match(calls(), /worktree rm --worktree id:wt-saved/);
+    // repo_id is NULL on this row (created before multi-host): the branch cleanup runs in the first configured id's base checkout.
+    assert.match(calls(), /terminal create --worktree id:r::\/srv\/base --title cleanup/);
     assert.strictEqual(db.getSession(handle, savedKey)?.state, "closed");
 
     // The shell never exits: not saved, so no worktree rm. Fast-forward the clock past the

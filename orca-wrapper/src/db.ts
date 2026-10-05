@@ -30,6 +30,7 @@ export interface Session {
   title: string | null; // kind 'task' only
   repo_app: string | null; // kind 'task' only — "Repo / App" multi-select, joined for the preamble
   prompt_template: string | null; // kind 'task' only — the first run's `prompt` (n8n/Notion-authored), kept for reference; see logic.renderPrompt
+  repo_id: string | null; // Orca repo id = agent host, chosen once when the worktree is created; NULL = created before multi-host (see worker.repoIdOf)
 }
 
 export interface Job {
@@ -74,7 +75,8 @@ export function openDb(path: string): DatabaseSync {
       wo INTEGER,
       title TEXT,
       repo_app TEXT,
-      prompt_template TEXT
+      prompt_template TEXT,
+      repo_id TEXT
     );
   `);
   // Looked up on every /pr route and by ensurePrSession — a task session's pr column is set once
@@ -107,6 +109,7 @@ export function openDb(path: string): DatabaseSync {
     title: "TEXT",
     repo_app: "TEXT",
     prompt_template: "TEXT",
+    repo_id: "TEXT",
   });
   addMissingColumns(db, "jobs", { kind: "TEXT" });
   // Startup recovery (markRunningJobsFailed) is the server's call, not openDb's: it has to tell

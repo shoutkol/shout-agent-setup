@@ -36,6 +36,7 @@ test("a first run that times out still opens the PR when its branch has commits"
     const prCreate = () => logs.find((l) => l.startsWith("[dry-run] POST /repos/shoutkol/shout/pulls"));
     await waitFor(() => prCreate() !== undefined, 15_000);
 
+    assert.strictEqual(db.getSession(handle, key)?.repo_id, "r"); // placed on the one connected host
     assert.strictEqual(jobs()[0].state, "failed");
     assert.match(jobs()[0].error ?? "", /timed out/);
     const pr = prCreate();

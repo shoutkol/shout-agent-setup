@@ -25,6 +25,20 @@ test("ok:true answers still parse normally", async () => {
   assert.deepStrictEqual(await orca.terminalList("w"), []);
 });
 
-test("repoPath resolves the base checkout for ORCA_REPO_ID from repo list", async () => {
-  assert.strictEqual(await orca.repoPath(), "/srv/base");
+test("repoPath resolves a repo id's base checkout from repo list", async () => {
+  assert.strictEqual(await orca.repoPath("r"), "/srv/base");
+  await assert.rejects(orca.repoPath("nope"), (err: any) => err.code === "repo_not_found");
+});
+
+test("repoHosts maps each repo id to its execution host", async () => {
+  assert.deepStrictEqual([...(await orca.repoHosts())], [["r", "ssh:ssh-1"], ["r2", "ssh:ssh-2"]]);
+});
+
+// `host list` ids have no "ssh:" prefix; hostsConnected adds it so they match repoHosts' values.
+test("hostsConnected returns only connected hosts, in repoHosts' id form", async () => {
+  assert.deepStrictEqual([...(await orca.hostsConnected())].sort(), ["local", "ssh:ssh-1"]);
+});
+
+test("worktreeCountsByRepo counts every worktree per repo id", async () => {
+  assert.deepStrictEqual([...(await orca.worktreeCountsByRepo())], [["r", 2], ["r2", 1]]);
 });

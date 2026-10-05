@@ -30,10 +30,21 @@ const dbPath = process.env.DB_PATH ?? `${home}/.local/share/orca-wrapper/state.s
 // ":memory:" (used by tests) has no directory component worth creating; dirname(".") is a no-op.
 mkdirSync(dirname(dbPath), { recursive: true });
 
+// One Orca repo id per agent host, in tie-break order (see logic.pickRepo). ORCA_REPO_ID is the
+// single-host name from before multi-host placement, still honoured so a deployed env keeps working.
+function parseRepoIds(): string[] {
+  const ids = (process.env.ORCA_REPO_IDS ?? process.env.ORCA_REPO_ID ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (ids.length === 0) throw new Error("missing required env var ORCA_REPO_IDS (or ORCA_REPO_ID)");
+  return ids;
+}
+
 export const config = {
   token: required("ORCA_WRAPPER_TOKEN"),
   orcaBin: process.env.ORCA_BIN ?? `${home}/.local/bin/orca`,
-  repoId: required("ORCA_REPO_ID"),
+  repoIds: parseRepoIds(),
   githubRepo: process.env.GITHUB_REPO ?? "shoutkol/shout",
   githubToken: await resolveGithubToken(),
   githubDryRun,
