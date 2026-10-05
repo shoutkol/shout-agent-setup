@@ -18,8 +18,9 @@
 #      --git-email EMAIL    git user.email      (default: keep existing)
 #      --key NAME           ssh key filename    (default: github)
 #
-#  Also installs earlyoom and an hourly claude-reaper timer so idle sessions
-#  and runaway tsc runs cannot swap the host to death.
+#  Also installs the memory guards (earlyoom, hourly claude-reaper, 8G swap)
+#  and the QA tooling (gh, agent-browser + Chrome), so every host the wrapper
+#  can place a session on is interchangeable.
 # =============================================================================
 set -euo pipefail
 
@@ -44,7 +45,7 @@ while [[ $# -gt 0 ]]; do
     --git-name)  GIT_NAME="$2";  shift 2 ;;
     --git-email) GIT_EMAIL="$2"; shift 2 ;;
     --key)       KEY_NAME="$2";  shift 2 ;;
-    -h|--help)   sed -n "2,23p" "$0"; exit 0 ;;
+    -h|--help)   sed -n "2,24p" "$0"; exit 0 ;;
     *) echo "!! Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -62,7 +63,7 @@ export NEEDRESTART_MODE=a
 export NEEDRESTART_SUSPEND=1
 
 # -----------------------------------------------------------------------------
-log "1/7  Host requirements (git + build toolchain)"
+log "1/8  Host requirements (git + build toolchain)"
 # -----------------------------------------------------------------------------
 # git      -> Orca runs `git worktree add` over SSH
 # make/g++ -> node-pty builds here; without them Orca still connects for files,
@@ -73,7 +74,7 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq git build-essential python3 curl rsync ca-certificates gnupg
 
 # -----------------------------------------------------------------------------
-log "2/7  Node.js 22 (system-wide)"
+log "2/8  Node.js 22 (system-wide)"
 # -----------------------------------------------------------------------------
 # System-wide on purpose. Orca launches agents over NON-INTERACTIVE ssh, which
 # does not source ~/.bashrc -- so nvm/fnm-managed node is invisible there and
@@ -117,7 +118,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "3/7  Git identity"
+log "3/8  Git identity"
 # -----------------------------------------------------------------------------
 # Commits are authored by whoever this host says it is -- set it to the agent
 # account, not your personal one, or every agent commit lands under your name.
@@ -134,7 +135,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "4/7  GitHub SSH key for this host"
+log "4/8  GitHub SSH key for this host"
 # -----------------------------------------------------------------------------
 # The host pushes on its own key, not through agent-forwarding: forwarded
 # agents die when your laptop sleeps, which is exactly the case Orca exists to
@@ -175,7 +176,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "5/7  Claude Code authentication"
+log "5/8  Claude Code authentication"
 # -----------------------------------------------------------------------------
 # Claude DESKTOP being signed in does not authenticate the Claude CODE CLI --
 # they keep separate credentials. Orca launches the CLI.
@@ -190,7 +191,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "6/7  Memory guards (earlyoom + claude-reaper)"
+log "6/8  Memory guards (earlyoom + claude-reaper + swap)"
 # -----------------------------------------------------------------------------
 # Every Orca terminal tab keeps a `claude` TUI alive (~250 MB each) for days, and
 # agents' `tsc` runs add ~2 GB apiece. Without a guard the box swaps until
@@ -294,10 +295,97 @@ UNIT
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now claude-reaper.timer
+
+# Swap: the third guard, and the one the host died without on 2026-09-30. A
+# DigitalOcean droplet ships with none, so an agent's `tsc` or a leaked Chrome
+# takes the box from "slow" to "Orca's relay stops answering" with nothing in
+# between. swappiness 10 keeps it for real pressure, not routine caching.
+if swapon --show --noheadings | grep -q .; then
+  echo "   swap already on: $(swapon --show=NAME,SIZE --noheadings | tr '\n' ' ')"
+else
+  sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap -q /swapfile && sudo swapon /swapfile
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+  echo "   8G /swapfile on, kept across reboots"
+fi
+echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-swappiness.conf >/dev/null
+sudo sysctl -q -p /etc/sysctl.d/99-swappiness.conf
+
 echo "   earlyoom active; claude-reaper runs hourly (DRY_RUN=1 /usr/local/bin/claude-reaper to preview)"
 
 # -----------------------------------------------------------------------------
-log "7/7  Repository"
+log "7/8  QA tooling (gh + agent-browser)"
+# -----------------------------------------------------------------------------
+# `/qa-agent` runs wherever the wrapper places a session, and the wrapper
+# balances across hosts -- so a host without these tools is not "a host that
+# can't do QA", it is a coin flip that fails a QA run (seen on PR 668, the
+# first run that landed on a second droplet). See docs/agents/qa-agent-host.md
+# in shoutkol/shout for what the skill expects.
+AGENT_BROWSER_VERSION="0.38.1"
+
+if command -v gh >/dev/null 2>&1; then
+  echo "   gh already installed: $(gh --version | head -1)"
+else
+  # Ubuntu's own `gh` lags badly; use GitHub's repo, as the other host does.
+  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg status=none
+  sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+  sudo apt-get update -qq && sudo apt-get install -y -qq gh
+  echo "   installed $(gh --version | head -1)"
+fi
+
+# To the user prefix: the global npm prefix is not writable, and ~/.local/bin is
+# already on PATH through Ubuntu's ~/.profile once the directory exists.
+npm i -g --silent --prefix "$HOME/.local" "agent-browser@$AGENT_BROWSER_VERSION"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Chrome + its system libraries. Skip the download when a browser is already
+# usable -- `doctor` ends with a headless launch check, which is the real test.
+if agent-browser doctor 2>&1 | grep -q "pass  Headless launch"; then
+  echo "   agent-browser $(agent-browser --version) ready, browser already usable"
+else
+  agent-browser install --with-deps || agent-browser install
+fi
+
+# Ubuntu 24.04's AppArmor denies the unprivileged user namespaces Chrome's
+# sandbox needs. Allow them for agent-browser's Chrome alone, so the sandbox
+# stays ON: this host also holds the pipeline's gh token.
+if [[ -d /etc/apparmor.d ]]; then
+  sudo tee /etc/apparmor.d/agent-browser-chrome >/dev/null <<APPARMOR
+abi <abi/4.0>,
+include <tunables/global>
+
+profile agent-browser-chrome $HOME/.agent-browser/browsers/**/chrome flags=(unconfined) {
+  userns,
+  include if exists <local/agent-browser-chrome>
+}
+APPARMOR
+  sudo apparmor_parser -r /etc/apparmor.d/agent-browser-chrome || true
+fi
+
+# Every --session is its own Chrome (~500 MB) and parallel QA subagents open a
+# few dozen; the stock 1 h idle timeout let 21 pile up and take the host down on
+# 2026-09-30. Never clobber an existing config -- it may hold other settings.
+mkdir -p "$HOME/.agent-browser"
+if [[ -f "$HOME/.agent-browser/config.json" ]]; then
+  echo "   ~/.agent-browser/config.json exists, left alone: $(tr -d '\n ' < "$HOME/.agent-browser/config.json")"
+else
+  printf '{ "idleTimeout": "10m" }\n' > "$HOME/.agent-browser/config.json"
+  echo "   agent-browser idle timeout set to 10m"
+fi
+
+if gh auth status >/dev/null 2>&1; then
+  echo "   gh authenticated as: $(gh auth status 2>&1 | sed -n 's/.*account \([^ ]*\).*/\1/p' | head -1)"
+else
+  echo "   !! gh is NOT logged in for $USER_NAME. /qa-agent needs it to read the PR,"
+  echo "      post its report and set labels. Run this once, interactively, as the"
+  echo "      agent account (not your personal one):"
+  echo "        gh auth login"
+fi
+
+# -----------------------------------------------------------------------------
+log "8/8  Repository"
 # -----------------------------------------------------------------------------
 if [[ -n "$REPO" ]]; then
   [[ -z "$DEST" ]] && DEST="$HOME/${REPO##*/}"
@@ -323,7 +411,8 @@ cat <<BANNER
   user      $USER_NAME
   host      $(hostname -s)  ($IP)
   repo      $DEST
-  guards    earlyoom (OOM) + claude-reaper.timer (hourly idle-session close)
+  guards    earlyoom (OOM) + claude-reaper.timer (hourly idle-session close) + 8G swap
+  qa tools  gh + agent-browser (Chrome) -- /qa-agent can run on this host
 
   ---------------------------------------------------------------------------
   NOW ON YOUR LAPTOP
