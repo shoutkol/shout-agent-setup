@@ -220,6 +220,11 @@ sudo tee /usr/local/bin/claude-reaper >/dev/null <<'REAPER'
 # Nothing is lost: the transcript stays on disk, so `claude --resume` in the
 # same worktree recovers the conversation.
 #
+# Not a durable close: Orca keeps the tab's resume record, and when that Orca
+# reconnects it reopens the tab with `claude --resume <id>` (seen 2026-10-05:
+# 5 of 18 came back). This frees RAM until then; closing for good is Orca's
+# `terminal close` or Sleep, from the Orca that owns the tab.
+#
 # Limits (hours, env-overridable):
 #   WRAPPER_IDLE_H=96  orca-wrapper worktrees (repo-pr-<n>, repo-claude-WO-*);
 #                      it closes its own sessions after 3 days, this only
@@ -253,7 +258,7 @@ for pid in $(pgrep -u "$(id -u)" -x claude || true); do
   echo "claude-reaper: pid=$pid idle=${idle_h}h (limit ${limit}h) cwd=$cwd$dry"
   [[ -n "$dry" ]] && continue
   # Whole group (takes its tsc/MCP children too), then the parent shell so the
-  # Orca tab exits and Orca does not reuse it. Only a shell gets the HUP: if
+  # Orca tab exits instead of sitting at a bare prompt. Only a shell gets the HUP: if
   # Orca ever spawned claude straight from its relay, HUP would drop the relay.
   if [[ -n "$pgid" ]] && (( pgid > 1 )); then
     kill -TERM -- "-$pgid" 2>/dev/null || true
