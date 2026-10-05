@@ -335,9 +335,13 @@ else
   echo "   installed $(gh --version | head -1)"
 fi
 
-# To the user prefix: the global npm prefix is not writable, and ~/.local/bin is
-# already on PATH through Ubuntu's ~/.profile once the directory exists.
+# To the user prefix: the global npm prefix is not writable. ~/.local/bin is on
+# PATH only for a LOGIN shell (Ubuntu's ~/.profile), and the agent's shell is
+# not one -- `/qa-agent` reported "agent-browser: command not found" on a host
+# where it was installed and working (PR 668). Link it where every shell looks,
+# the same reason Node is installed system-wide in step 2.
 npm i -g --silent --prefix "$HOME/.local" "agent-browser@$AGENT_BROWSER_VERSION"
+sudo ln -sfn "$HOME/.local/bin/agent-browser" /usr/local/bin/agent-browser
 export PATH="$HOME/.local/bin:$PATH"
 
 # Chrome + its system libraries. Skip the download when a browser is already
