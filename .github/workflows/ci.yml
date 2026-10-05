@@ -1,0 +1,116 @@
+# Tests every PR, and on main deploys orca-wrapper to the GCE Orca desktop.
+#
+# The deploy is an HTTP call, not SSH: the desktop has no inbound SSH, but the
+# wrapper itself exposes POST /admin/deploy behind Caddy (fast-forwards its
+# checkout to origin/main, then exits 75 so systemd restarts it). Two repo
+# secrets (Settings -> Secrets and variables -> Actions), the same values
+# shoutkol/shout already holds:
+#   ORCA_WRAPPER_URL    https://orca.shouttgt.com
+#   ORCA_WRAPPER_TOKEN  the token in ~/.config/orca-wrapper/env on the VM
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: orca-wrapper/package-lock.json
+      - run: npm ci
+        working-directory: orca-wrapper
+      - run: npm run typecheck
+        working-directory: orca-wrapper
+      - run: npm test
+        working-directory: orca-wrapper
+      # The host-setup scripts are the other half of this repo and never run in CI,
+      # so at least parse them, plus the claude-reaper heredoc inside the big one.
+      - name: bash -n the setup scripts
+        run: |
+          set -euo pipefail
+          for f in *.sh; do bash -n "$f"; done
+          sed -n "/<<'REAPER'/,/^REAPER$/p" setup-orca-target.sh | sed '1d;$d' > /tmp/claude-reaper
+          bash -n /tmp/claude-reaper
+
+  deploy:
+    # Only for merges to main that actually touched the service.
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Did this push touch orca-wrapper/?
+        id: changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # A new branch or a force-push gives an all-zero "before" with nothing to
+          # compare against; deploy rather than silently skip.
+          if [[ "$BEFORE" =~ ^0+$ ]]; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${GITHUB_SHA}" --jq '.files[].filename')"
+          if grep -q '^orca-wrapper/' <<< "$files"; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "touched=false" >> "$GITHUB_OUTPUT"
+            echo "no orca-wrapper/ changes in this push; skipping deploy"
+          fi
+
+      - name: Deploy and restart
+        if: steps.changed.outputs.touched == 'true'
+        env:
+          URL: ${{ secrets.ORCA_WRAPPER_URL }}
+          TOKEN: ${{ secrets.ORCA_WRAPPER_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${URL:-}" || -z "${TOKEN:-}" ]]; then
+            echo "ORCA_WRAPPER_URL / ORCA_WRAPPER_TOKEN are not set on this repo" >&2
+            exit 1
+          fi
+          # A restart fails every job that is mid-run, so the wrapper answers 409
+          # while any is running. Wait it out rather than interrupting an agent;
+          # 10 tries, a minute apart, covers a normal turn.
+          for attempt in $(seq 1 10); do
+            code="$(curl -sS -o /tmp/deploy.json -w '%{http_code}' -X POST "$URL/admin/deploy" \
+                     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}')"
+            cat /tmp/deploy.json; echo
+            case "$code" in
+              202) echo "deployed"; exit 0 ;;
+              409) echo "attempt $attempt: a job is running, retrying in 60s" ; sleep 60 ;;
+              *)   echo "deploy failed with HTTP $code" >&2; exit 1 ;;
+            esac
+          done
+          echo "still busy after 10 minutes; deploy it by hand or retry this job" >&2
+          exit 1
+
+      - name: Confirm what is live
+        if: steps.changed.outputs.touched == 'true'
+        env:
+          URL: ${{ secrets.ORCA_WRAPPER_URL }}
+          TOKEN: ${{ secrets.ORCA_WRAPPER_TOKEN }}
+        run: |
+          set -euo pipefail
+          # systemd brings the process back ~5 s after the 75 exit; give it room.
+          sleep 20
+          for attempt in $(seq 1 5); do
+            if curl -fsS "$URL/admin/health" -H "Authorization: Bearer $TOKEN"; then
+              echo; exit 0
+            fi
+            sleep 10
+          done
+          echo "the wrapper did not answer /admin/health after the restart" >&2
+          exit 1

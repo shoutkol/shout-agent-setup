@@ -93,11 +93,20 @@ systemctl --user restart orca-wrapper
 echo "$NEW"
 ```
 
-Then update the `ORCA_WRAPPER_TOKEN` secret on `shoutkol/shout` to match --
+Then update the `ORCA_WRAPPER_TOKEN` secret on `shoutkol/shout` AND on
+`shoutkol/shout-agent-setup` (the deploy workflow uses it) to match --
 the old and new tokens are not both valid at once, so do this right before
 or right after, not hours apart.
 
 ## Update
+
+Merging to `main` deploys by itself: `.github/workflows/ci.yml` runs the tests, then
+POSTs `/admin/deploy` (below) once the push touches `orca-wrapper/`. It waits out a
+409 for up to 10 minutes rather than killing a running agent turn, and finishes by
+reading `/admin/health` back. It needs `ORCA_WRAPPER_URL` and `ORCA_WRAPPER_TOKEN`
+as secrets on **this** repo as well as on `shoutkol/shout`.
+
+By hand, on the VM:
 
 ```bash
 cd ~/shout-agent-setup && git pull
