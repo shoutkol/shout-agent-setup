@@ -40,6 +40,32 @@ test("a longer sentence that starts with stop is a prompt, not a stop", () => {
   });
 });
 
+const MARKER = "[orca-request kind=comment author=ziveso]";
+
+test("a dev-stats marker before stop does not turn it into a prompt (PR 881)", () => {
+  for (const body of [`/orca ${MARKER}\nstop`, `/orca ${MARKER} stop`, `/orca ${MARKER}\nStop!`, `/orca ${MARKER}\nplease stop`]) {
+    assert.deepStrictEqual(parseCommand(body), { type: "stop" }, body);
+  }
+});
+
+test("a marker with nothing after it is help", () => {
+  assert.deepStrictEqual(parseCommand(`/orca ${MARKER}`), { type: "help" });
+  assert.deepStrictEqual(parseCommand(`/orca ${MARKER}\n  \n`), { type: "help" });
+});
+
+test("a marker followed by a real prompt stays a prompt and keeps the marker", () => {
+  assert.deepStrictEqual(parseCommand(`/orca ${MARKER}\nfix lint`), { type: "prompt", prompt: `${MARKER}\nfix lint` });
+  assert.deepStrictEqual(parseCommand(`/orca ${MARKER}\nstop the dev server and rerun the tests`), {
+    type: "prompt",
+    prompt: `${MARKER}\nstop the dev server and rerun the tests`,
+  });
+});
+
+test("a malformed marker is not skipped", () => {
+  assert.deepStrictEqual(parseCommand("/orca [orca-request kind=x\nstop"), { type: "prompt", prompt: "[orca-request kind=x\nstop" });
+  assert.deepStrictEqual(parseCommand(`/orca ${MARKER}stop`), { type: "prompt", prompt: `${MARKER}stop` });
+});
+
 test("isSafeRef: real branch names pass", () => {
   for (const ref of ["dev", "claude/WO-74-test-orca-e2e-qa-ignore", "feat/kol-tag-discovery-phase2", "qa/orca-e2e-plain", "v1.2_fix"]) {
     assert.strictEqual(isSafeRef(ref), true, ref);

@@ -9,12 +9,19 @@ export type Command = { type: "stop" } | { type: "help" } | { type: "prompt"; pr
 // must not trust that and re-checks here. Bare "/orca" asks for the usage text. "stop" also
 // accepts the ways people actually type it ("stop.", "Stop!", "stop please", "please stop") —
 // anything longer is a prompt, since "stop the dev server and rerun the tests" is real work.
+//
+// The workflow also puts a dev-stats marker right after "/orca" (`/orca [orca-request kind=comment
+// author=x]\nstop`, PR 881 job 1077). Deciding stop/help must look past that one marker, or "stop"
+// became a queued prompt and the session never closed. A real prompt keeps the marker in `prompt`
+// untouched: typedRequestLine and dev-stats read it from there.
 export function parseCommand(body: string): Command {
   const match = /^\/orca(?:\s+([\s\S]*))?$/.exec(body.trim());
   if (!match) return null;
   const rest = (match[1] ?? "").trim();
-  if (!rest) return { type: "help" };
-  if (/^(?:please\s+)?stop(?:\s+please)?[\s.!]*$/i.test(rest)) return { type: "stop" };
+  const marker = REQUEST_MARKER.exec(rest)?.[0];
+  const afterMarker = marker && /^\s|^$/.test(rest.slice(marker.length)) ? rest.slice(marker.length).trim() : rest;
+  if (!afterMarker) return { type: "help" };
+  if (/^(?:please\s+)?stop(?:\s+please)?[\s.!]*$/i.test(afterMarker)) return { type: "stop" };
   return { type: "prompt", prompt: rest };
 }
 
@@ -233,4 +240,12 @@ export function pickRepo(
     }
   }
   return best;
+}
+
+// Whether a failed run's reason says the agent itself is gone: Orca ends the run with
+// `terminal_exited` when Claude quit in the session's terminal and left a bare shell (PR 881).
+// That shell is never tui-idle, so a session that kept its automation/terminal handle made every
+// later job wait busyWaitMin and fail as "still busy". Such a session must start a fresh agent.
+export function agentExited(reason: string): boolean {
+  return /\bterminal_exited\b/.test(reason);
 }
