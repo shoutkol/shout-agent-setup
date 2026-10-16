@@ -8,7 +8,7 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, pickRepo, stable, renderPrompt, shq, TURN_STATE_MAX_FAILURES } from "./logic.ts";
+import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, pickRepo, stable, renderPrompt, shq, typedRequestLine, TURN_STATE_MAX_FAILURES } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
 import { COMMENT_MAX_CHARS, looksCapped, matchesSnapshot, readFullAnswer, readTurnState, splitText } from "./answer.ts";
@@ -23,6 +23,8 @@ const DOWNLOAD_MAX_MS = 60_000;
 // its agent to go idle: a run the wrapper gave up on (timeout) or lost track of (restart) is often
 // still going, and a second `automations run` on top of it forks the session.
 const AGENT_IDLE_POLL_MS = 10_000;
+// Lets Orca finish submitting the automation prompt before the typed line goes in behind it.
+const TYPED_LINE_DELAY_MS = 3_000;
 // While background sub-agents are still running, or the transcript couldn't be read, how often to
 // re-read it.
 const TURN_STATE_RECHECK_MS = 15_000;
@@ -151,7 +153,10 @@ export function createWorker(handle: DatabaseSync) {
       // per follow-up), so its own first 40 chars are the marker instead — or none, for a prompt
       // too short to be told apart from an answer (see logic.launchMarker).
       const marker = session.kind === "pr" || job.comment_id != null ? PREAMBLE_MARKER : launchMarker(prompt);
-      const result = await waitForCompletion(session, runId, marker);
+      // Only a PR-comment job gets the typed line: that is the path the workflow's token and the
+      // comment author were checked on. Task jobs, stop/help and closed-PR paths never get here.
+      const typedLine = job.comment_id != null && session.pr ? typedRequestLine(session.pr, job.author, job.prompt) : null;
+      const result = await waitForCompletion(session, runId, marker, typedLine);
       if (result.outcome === "done" && !result.fromTranscript && looksCapped(result.content, result.truncated)) {
         const full = await recoverFullAnswer(session, result.content);
         if (full) Object.assign(result, { content: full, truncated: false });
@@ -395,7 +400,7 @@ export function createWorker(handle: DatabaseSync) {
     throw new Error(`worktree ${worktreeId} did not check out ${branch} within ${BRANCH_POLL_MAX_MS}ms`);
   }
 
-  async function waitForCompletion(session: db.Session, runId: string, marker: string): Promise<CompletionResult> {
+  async function waitForCompletion(session: db.Session, runId: string, marker: string, typedLine: string | null): Promise<CompletionResult> {
     const deadline = Date.now() + config.runTimeoutMin * 60_000;
     // Resolved from this run's terminalSessionId, not reused from the session row: when the
     // previous live session is gone Orca silently starts a new one, and the stored handle would
@@ -404,6 +409,7 @@ export function createWorker(handle: DatabaseSync) {
     let prevCapturedAt: string | null = null;
     let nextTurnStateAt = 0;
     let failedTurnStateReads = 0; // in a row, see logic.backgroundVerdict
+    let typedLineSent = false;
 
     while (Date.now() < deadline) {
       const runs = await orca.automationRuns(session.automation_id!);
@@ -420,6 +426,14 @@ export function createWorker(handle: DatabaseSync) {
           terminalHandle = match.handle;
           db.updateSession(handle, session.key, { terminal_handle: terminalHandle });
         }
+      }
+
+      // Once, after the run's prompt has been submitted: typed text, so the agent sees a message
+      // the user wrote next to the paste. A failed send is logged; the run carries on as before.
+      if (typedLine && terminalHandle && !typedLineSent) {
+        typedLineSent = true;
+        await sleep(TYPED_LINE_DELAY_MS);
+        await orca.terminalSend(terminalHandle, typedLine).catch((err) => console.log(`typed line failed key=${session.key}: ${err}`));
       }
 
       if (run.status === "failed" || run.status === "cancelled" || run.status === "error") {
