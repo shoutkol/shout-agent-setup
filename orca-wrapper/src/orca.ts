@@ -158,6 +158,11 @@ export async function terminalRead(
   return { lines, next, start: cursor ?? next - lines.length, oldest: Number(t.oldestCursor ?? 0) };
 }
 
+// Types `text` into the terminal and presses Enter. Callers pass one line.
+export async function terminalSend(handle: string, text: string): Promise<void> {
+  await run(["terminal", "send", "--terminal", handle, "--text", text, "--enter"]);
+}
+
 export async function terminalClose(handle: string): Promise<void> {
   await run(["terminal", "close", "--terminal", handle]);
 }

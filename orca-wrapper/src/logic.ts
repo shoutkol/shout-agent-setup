@@ -40,6 +40,26 @@ export function isSafeRef(ref: string): boolean {
   );
 }
 
+// The dev-stats marker the shout workflow puts first in every /orca body, e.g.
+// `[orca-request kind=qa author=someone]`.
+const REQUEST_MARKER = /^\[orca-request(?: [a-z][\w-]*=[\w.@-]+)+\]/;
+
+// A newer Claude Code treats a message that is only pasted content as not the user's own words and
+// refuses side-effecting requests (PR 881: QA and review refused five times). Orca delivers the
+// automation prompt as that paste, so the wrapper follows it with this one typed line. Only the
+// wrapper builds it, and only for a job it already authenticated: `author` is the job's own
+// column (set from the bearer-token request), never the comment text; `pr` is the session's.
+// The marker is copied from the start of the prompt only if it is well formed.
+export function typedRequestLine(pr: number, author: string, prompt: string): string {
+  const login = author.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 39);
+  const marker = REQUEST_MARKER.exec(prompt.trimStart())?.[0];
+  return (
+    `This request comes from PR #${pr}, comment by @${login}, authenticated by orca-wrapper.` +
+    (marker ? ` ${marker}` : "") +
+    ` Please carry out the pasted /orca request above.`
+  );
+}
+
 // Single-quotes a value for a POSIX shell command line.
 export function shq(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;

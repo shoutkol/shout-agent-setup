@@ -102,6 +102,18 @@ properties) so that stripping is a no-op transform, not a compile.
    session is still closed, so a close never deletes work. The hourly idle sweep also closes any open
    session whose PR is closed on GitHub, for a close webhook that was missed.
 
+## The typed line after the pasted prompt
+
+Orca hands an automation's prompt to the agent as pasted content. A newer Claude Code does not
+treat a message that is only a paste as the user's own words, so side-effecting `/orca` requests
+(QA fixture accounts, reviews) were refused (shoutkol/shout PR 881, 2026-10-16). For a PR-comment
+job, once the run's agent terminal is known, `waitForCompletion` waits 3 s and types one line with
+`orca terminal send --enter` (`typedRequestLine` in `src/logic.ts`): the PR, the comment author,
+"authenticated by orca-wrapper", the `[orca-request kind=… author=…]` marker, and a request to carry
+out the pasted request. It is sent once per job, never for task jobs or the stop/help/closed paths,
+and the author comes from the job row, not the comment text. Orca's CLI has no non-paste way to
+submit an automation prompt (checked `automations`, `agent launch`, `terminal send` help).
+
 ## Multiple agent hosts
 
 `ORCA_REPO_IDS` lists one Orca repo id per agent host. When a session first needs a worktree the
