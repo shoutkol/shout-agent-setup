@@ -8,7 +8,7 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { backgroundVerdict, isDone, isLaunchFrame, launchMarker, pickRepo, stable, renderPrompt, shq, typedRequestLine, TURN_STATE_MAX_FAILURES } from "./logic.ts";
+import { agentExited, backgroundVerdict, isDone, isLaunchFrame, launchMarker, pickRepo, stable, renderPrompt, shq, typedRequestLine, TURN_STATE_MAX_FAILURES } from "./logic.ts";
 import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
 import { COMMENT_MAX_CHARS, looksCapped, matchesSnapshot, readFullAnswer, readTurnState, splitText } from "./answer.ts";
@@ -169,6 +169,7 @@ export function createWorker(handle: DatabaseSync) {
       } else {
         db.markJobFailed(handle, job.id, result.reason);
         db.touchSession(handle, session.key);
+        if (agentExited(result.reason)) await resetAgent(session);
         await handleFailure(session, job, result.reason);
       }
     } catch (err: any) {
@@ -181,6 +182,23 @@ export function createWorker(handle: DatabaseSync) {
     } finally {
       await maybeFinishClosing(job.session_key).catch((e) => console.log(`deferred close failed key=${job.session_key}: ${e}`));
     }
+  }
+
+  // The session's Claude exited and left a bare shell, which never reports tui-idle again, so the
+  // next job would wait busyWaitMin and fail as "busy" (PR 881). Forget the agent so the next job
+  // takes the normal automationCreate path. The worktree is kept: it may hold unpushed work.
+  async function resetAgent(stale: db.Session): Promise<void> {
+    // Re-read: waitForCompletion stored the terminal handle after `stale` was loaded.
+    const session = db.getSession(handle, stale.key) ?? stale;
+    console.log(`agent exited, resetting key=${session.key}`);
+    if (session.automation_id) {
+      await orca.automationRemove(session.automation_id).catch((err) => console.log(`automationRemove failed key=${session.key}: ${err}`));
+    }
+    // Removing the automation does not close its terminal; the bare shell is still open.
+    if (session.terminal_handle) {
+      await orca.terminalClose(session.terminal_handle).catch((err) => console.log(`terminalClose failed key=${session.key}: ${err}`));
+    }
+    db.updateSession(handle, session.key, { automation_id: null, terminal_handle: null });
   }
 
   // True once the session's agent terminal reports tui-idle. No handle yet (first run) or a handle
