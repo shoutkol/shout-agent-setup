@@ -42,6 +42,24 @@ test("sweepIdle closes an open session whose PR is closed on GitHub and leaves o
   }
 });
 
+test("sweepIdle leaves a session open whose PR was merged into main (release.yml closes it), but closes one merged elsewhere", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string) => {
+    const intoMain = String(url).endsWith("/pulls/1207");
+    return new Response(JSON.stringify({ state: "closed", merged: true, base: { ref: intoMain ? "main" : "dev" } }));
+  }) as typeof fetch;
+  try {
+    const handle = db.openDb(":memory:");
+    const mainKey = openSession(handle, 1207, null);
+    const devKey = openSession(handle, 1208, null);
+    await createWorker(handle).sweepIdle();
+    assert.strictEqual(db.getSession(handle, mainKey)?.state, "ready");
+    assert.strictEqual(db.getSession(handle, devKey)?.state, "closed");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test("teardown saves unsaved work first, and keeps the worktree when the save does not finish", async () => {
   const calls = () => readFileSync(orcaLog, "utf8");
   const realNow = Date.now;

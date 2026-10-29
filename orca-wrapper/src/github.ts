@@ -1,5 +1,6 @@
 // GitHub REST calls, via global fetch — just the endpoints the wrapper needs.
 import { config } from "./config.ts";
+import type { PullInfo } from "./logic.ts";
 
 const API = "https://api.github.com";
 
@@ -100,19 +101,25 @@ export async function createPullRequest(params: {
 }
 
 // Checked before queueing a prompt: a closed PR's close event has already fired, so a session
-// opened for it now would never be torn down. Dry-run pretends every PR is open.
-export async function pullState(pr: number): Promise<"open" | "closed"> {
+// opened for it now would never be torn down — unless it is a release-notes request on a PR merged
+// into main (logic.acceptsOnClosedPr), hence `merged` and `baseRef` from the same call. Dry-run
+// pretends every PR is open.
+export async function pullInfo(pr: number): Promise<PullInfo> {
   if (config.githubDryRun) {
     console.log(`[dry-run] GET /repos/${config.githubRepo}/pulls/${pr}`);
-    return "open";
+    return { state: "open", merged: false, baseRef: "" };
   }
   const res = await fetch(`${API}/repos/${config.githubRepo}/pulls/${pr}`, { headers: authHeaders() });
   if (!res.ok) {
     const snippet = (await res.text()).slice(0, 500);
     throw new Error(`github get PR #${pr} failed: ${res.status} ${snippet}`);
   }
-  const body = (await res.json()) as { state: string };
-  return body.state === "closed" ? "closed" : "open";
+  const body = (await res.json()) as { state: string; merged?: boolean; merged_at?: string | null; base?: { ref?: string } };
+  return {
+    state: body.state === "closed" ? "closed" : "open",
+    merged: body.merged === true || body.merged_at != null,
+    baseRef: body.base?.ref ?? "",
+  };
 }
 
 // The PR (any state) whose head is `branch` in this repo, newest first — for a re-dispatched work

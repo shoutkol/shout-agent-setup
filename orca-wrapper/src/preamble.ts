@@ -18,3 +18,16 @@ export function preamble(headRef: string, pr: number): string {
     `line starting \`QUESTION:\`.`
   );
 }
+
+// For a `/release-notes` run on a PR already merged into main, in a session server.ts checked out
+// on main because the PR's head branch is usually deleted by then. Read-only: the agent reads the
+// PR through `gh` and edits its body, and must never push to main.
+export function mergedPreamble(pr: number): string {
+  return (
+    `${PREAMBLE_MARKER} checked out on \`origin/main\`, because PR #${pr} is already merged into main ` +
+    `and its head branch may be gone. Read the PR through \`gh\`; do not commit, push, create ` +
+    `branches or open PRs from this worktree. Do not post GitHub comments yourself — your final ` +
+    `reply is posted to the PR automatically, so make it a concise summary; if you are blocked or ` +
+    `need a decision, end with a line starting \`QUESTION:\`.`
+  );
+}

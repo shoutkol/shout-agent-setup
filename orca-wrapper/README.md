@@ -33,7 +33,7 @@ Read once at startup in `src/config.ts`.
 | `GITHUB_DRY_RUN` | no | unset | `1` logs GitHub calls instead of making them (local smoke tests). |
 | `PORT` | no | `8787` | Bound to `127.0.0.1` only — Caddy fronts it. |
 | `DB_PATH` | no | `${HOME}/.local/share/orca-wrapper/state.sqlite` | SQLite file (dir is created if missing). |
-| `IDLE_DAYS` | no | `3` | Sessions idle this long are closed by the hourly sweep, which also closes any open session whose PR is closed on GitHub (a missed webhook). |
+| `IDLE_DAYS` | no | `3` | Sessions idle this long are closed by the hourly sweep, which also closes any open session whose PR is closed on GitHub (a missed webhook) — except a PR merged into `main`, see [Release notes on a merged PR](#release-notes-on-a-merged-pr). |
 | `RUN_TIMEOUT_MIN` | no | `60` | Max time to wait for one automation run to finish. |
 | `BUSY_WAIT_MIN` | no | `10` | Before a session's next run, max time to wait for its agent terminal to go idle (a timed-out or pre-restart run may still be going). Past it, the job fails with a note instead of running on top. |
 
@@ -100,7 +100,33 @@ properties) so that stripping is a no-op transform, not a compile.
    Before removing the worktree, the worker commits anything uncommitted or unpushed and pushes it
    to `orca-wip/<session key>`; if that save doesn't finish, the worktree is left on disk and the
    session is still closed, so a close never deletes work. The hourly idle sweep also closes any open
-   session whose PR is closed on GitHub, for a close webhook that was missed.
+   session whose PR is closed on GitHub, for a close webhook that was missed — except one merged
+   into `main`, which release.yml closes itself (next section).
+
+## Release notes on a merged PR
+
+Every command on a closed PR is refused with the "PR #N is closed" note: its close event has
+already fired, so a session opened now would never be torn down. One request is the exception:
+shoutkol/shout's release manager (`tools/release-notes/`, `.github/workflows/release.yml`) asks
+for `/release-notes <n>` or `/release-notes <n> final` on a PR **after** it is merged into `main`,
+and refusing it meant hotfixes merged straight into main (#896, #1207, #1134) were never announced.
+
+- **Accepted** when `GET /pulls/<n>` says `state: closed`, `merged: true`, `base.ref == main`, and
+  the prompt — after an optional `[orca-request …]` marker — is exactly `/release-notes <n>` or
+  `/release-notes <n> final`, with `<n>` this PR's own number (`acceptsOnClosedPr` in
+  `src/logic.ts`). Everything else on a closed PR is refused as before, with the same note.
+- **Session.** A session still open for the PR is reused as it is, on whatever ref it already has.
+  Otherwise a new `pr-<n>` session is checked out on `main`, not the PR's head branch, which is
+  usually deleted by then; the merged code is in main anyway, and the agent only reads the PR
+  through `gh` and edits its body. Such a run gets a read-only preamble (`mergedPreamble` in
+  `src/preamble.ts`) instead of the usual "push to `HEAD:<head>`", which would say `HEAD:main`.
+- **Close.** release.yml sends `DELETE /pr/<n>` once the summary is complete, which is why
+  shout's orca.yml leaves sessions of PRs merged into main open. The hourly sweep leaves them open
+  too (closing one could fail a queued `final`); `IDLE_DAYS` still closes one that never gets its
+  DELETE.
+- **`comment_id: 0`.** release.yml sends 0 when there is no comment behind the request. 0 is not
+  used as a dedupe key (it made every such request a duplicate of the first one ever sent); the
+  same prompt already queued or running in the PR's session is the duplicate instead, as for tasks.
 
 ## The typed line after the pasted prompt
 
@@ -159,7 +185,7 @@ otherwise). All JSON.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `POST` | `/pr/{n}/prompt` | `{ head_ref, base_ref, comment_id, body, author }` | 202 `{ job_id, position }`; 202 `{ closed: true }` for a stop; 202 `{ help: true }` for a bare `/orca` (usage posted to the PR); 202 `{ pr_closed: true }` if the PR is closed (a note is posted, nothing runs); 400 if `head_ref` isn't a plain branch name |
+| `POST` | `/pr/{n}/prompt` | `{ head_ref, base_ref, comment_id, body, author }` | 202 `{ job_id, position }`; 202 `{ closed: true }` for a stop; 202 `{ help: true }` for a bare `/orca` (usage posted to the PR); 202 `{ pr_closed: true }` if the PR is closed (a note is posted, nothing runs) — except `/release-notes <n> [final]` on a PR merged into `main`, which is queued (see above); 400 if `head_ref` isn't a plain branch name |
 | `GET` | `/pr/{n}` | — | 200 `{ session, queue, last_output }`, or 404 |
 | `DELETE` | `/pr/{n}` | — | 202 `{ closed: true }`, or 404 |
 | `POST` | `/tasks` | `{ notion_url, wo, title, prompt, author?, repo_app? }` | 202 `{ key, job_id, position }` |
