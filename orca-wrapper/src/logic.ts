@@ -249,3 +249,32 @@ export function pickRepo(
 export function agentExited(reason: string): boolean {
   return /\bterminal_exited\b/.test(reason);
 }
+
+// A closed PR gets no new session (its close event has already fired, so nothing would ever tear
+// that session down) — with one exception. shoutkol/shout's release manager (tools/release-notes,
+// release.yml) asks for `/release-notes <n>` or `/release-notes <n> final` on a PR AFTER it lands
+// in main: a hotfix merged straight into main is only summarised then, and refusing it meant those
+// releases were never announced (#896, #1207, #1134). release.yml closes that session itself with
+// `DELETE /pr/<n>` once the summary is complete, which is why shout's orca.yml leaves sessions of
+// PRs merged into main open. Anything else on a closed PR is still refused.
+export const RELEASE_BASE = "main";
+
+export type PullInfo = { state: "open" | "closed"; merged: boolean; baseRef: string };
+
+// `prompt` is the command's prompt as parseCommand returns it: the dev-stats marker, when present,
+// is still at its head (release.yml sends `/orca [orca-request kind=release …]\n/release-notes 1207`).
+// The PR number must be this PR's own — a summary request is always about the PR it is sent on.
+export function isReleaseNotesPrompt(prompt: string, pr: number): boolean {
+  const marker = REQUEST_MARKER.exec(prompt)?.[0];
+  const rest = (marker ? prompt.slice(marker.length) : prompt).trim();
+  const m = /^\/release-notes\s+(\d+)(?:\s+final)?$/.exec(rest);
+  return m !== null && Number(m[1]) === pr;
+}
+
+export function mergedIntoRelease(info: PullInfo): boolean {
+  return info.state === "closed" && info.merged && info.baseRef === RELEASE_BASE;
+}
+
+export function acceptsOnClosedPr(info: PullInfo, prompt: string, pr: number): boolean {
+  return mergedIntoRelease(info) && isReleaseNotesPrompt(prompt, pr);
+}

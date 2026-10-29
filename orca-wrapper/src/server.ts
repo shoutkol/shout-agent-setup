@@ -5,7 +5,7 @@ import { URL } from "node:url";
 import { config } from "./config.ts";
 import { openDb, getSessionByPr, getSession, getQueue, getLastOutput, listOpenSessions, taskKey, markRunningJobsFailed } from "./db.ts";
 import { createWorker } from "./worker.ts";
-import { parseCommand, branchFor, isNotionUrl, isSafeRef, USAGE } from "./logic.ts";
+import { parseCommand, branchFor, isNotionUrl, isSafeRef, acceptsOnClosedPr, RELEASE_BASE, USAGE } from "./logic.ts";
 import * as github from "./github.ts";
 import * as admin from "./admin.ts";
 
@@ -131,12 +131,23 @@ export function startServer(options: { exit?: (code: number) => void } = {}) {
         send(res, 202, { closed: true });
         return 202;
       }
-      if ((await github.pullState(pr)) === "closed") {
-        await github.comment(pr, `🐳 orca: PR #${pr} is closed, so there's no session to run this in. Reopen the PR to use /orca again.`);
-        send(res, 202, { pr_closed: true });
-        return 202;
+      const info = await github.pullInfo(pr);
+      let sessionRef = headRef;
+      if (info.state === "closed") {
+        if (!acceptsOnClosedPr(info, cmd.prompt, pr)) {
+          await github.comment(pr, `🐳 orca: PR #${pr} is closed, so there's no session to run this in. Reopen the PR to use /orca again.`);
+          send(res, 202, { pr_closed: true });
+          return 202;
+        }
+        // A release-notes request on a PR merged into main. Its head branch is often deleted by
+        // then, so a new session is checked out on main (which always exists, and holds the merged
+        // code) — the agent only reads the PR through `gh` and edits its body. A session still open
+        // for the PR is reused as it is, on whatever ref it already has. The key stays pr-<n>
+        // either way, so release.yml's `DELETE /pr/<n>` closes it.
+        const live = getSessionByPr(db, pr);
+        sessionRef = live && live.state !== "closed" && live.head_ref ? live.head_ref : RELEASE_BASE;
       }
-      const queued = worker.enqueuePrJob(pr, headRef, commentId, author, cmd.prompt);
+      const queued = worker.enqueuePrJob(pr, sessionRef, commentId, author, cmd.prompt);
       if ("rejected" in queued) {
         await github.comment(pr, "🐳 orca: this PR's session is stopping, so this request wasn't queued. Send it again once the current answer is posted.");
         send(res, 202, { rejected: queued.rejected });

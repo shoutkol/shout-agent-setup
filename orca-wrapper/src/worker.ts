@@ -8,8 +8,8 @@ import { config } from "./config.ts";
 import * as db from "./db.ts";
 import * as orca from "./orca.ts";
 import * as github from "./github.ts";
-import { agentExited, backgroundVerdict, isDone, isLaunchFrame, launchMarker, pickRepo, stable, renderPrompt, shq, typedRequestLine, TURN_STATE_MAX_FAILURES } from "./logic.ts";
-import { preamble, PREAMBLE_MARKER } from "./preamble.ts";
+import { agentExited, backgroundVerdict, isDone, isLaunchFrame, launchMarker, pickRepo, stable, renderPrompt, shq, typedRequestLine, TURN_STATE_MAX_FAILURES, RELEASE_BASE, isReleaseNotesPrompt, mergedIntoRelease } from "./logic.ts";
+import { mergedPreamble, preamble, PREAMBLE_MARKER } from "./preamble.ts";
 import { attachmentDir, downloadCommand, extensionOf, extractAttachmentUrls, rewritePrompt, type Attachment } from "./attachments.ts";
 import { COMMENT_MAX_CHARS, looksCapped, matchesSnapshot, readFullAnswer, readTurnState, splitText } from "./answer.ts";
 
@@ -60,10 +60,20 @@ export function createWorker(handle: DatabaseSync) {
   // Re-running the workflow redelivers the same comment (same id): hand back the job we already
   // have instead of running the prompt twice. A session that is shutting down (/orca stop while a
   // job runs) takes nothing new — it would run against an automation that's about to be removed.
+  //
+  // A caller with no comment behind its request sends comment_id 0 (shout's release manager does,
+  // see tools/release-notes/cli.mjs sendOrca). 0 is not an id: matching on it handed every such
+  // request the first job ever sent with 0, so nothing new ran. Those are deduped like tasks
+  // instead — the same prompt already waiting or running in this PR's session.
   function enqueuePrJob(pr: number, headRef: string, commentId: number, author: string, prompt: string): EnqueueResult {
-    const dup = db.findJobByCommentId(handle, commentId);
-    if (dup) return { jobId: dup.id, position: db.positionOf(handle, dup), deduped: true };
     const existing = db.getSessionByPr(handle, pr);
+    const dup =
+      commentId > 0
+        ? db.findJobByCommentId(handle, commentId)
+        : existing && existing.state !== "closed"
+          ? db.findActiveDuplicate(handle, existing.key, prompt)
+          : undefined;
+    if (dup) return { jobId: dup.id, position: db.positionOf(handle, dup), deduped: true };
     if (existing?.state === "closing") return { rejected: "closing" };
     const session = db.ensurePrSession(handle, pr, headRef);
     const { id, position } = db.enqueueJob(handle, session.key, commentId, author, prompt);
@@ -116,7 +126,7 @@ export function createWorker(handle: DatabaseSync) {
 
   async function processJob(job: db.Job): Promise<void> {
     try {
-      if (job.comment_id != null) {
+      if (job.comment_id != null && job.comment_id > 0) {
         await github.react(job.comment_id, "eyes").catch((err) => console.log(`react failed key=${job.session_key}: ${err}`));
       }
 
@@ -394,7 +404,13 @@ export function createWorker(handle: DatabaseSync) {
     // the PR preamble and its images staged. Without it an /orca on a WO-PR reached the agent as
     // bare comment text: no pull first, no "don't open PRs", no images (H-05).
     if (session.kind === "pr" || (job.comment_id != null && session.pr)) {
-      return preamble(session.head_ref!, session.pr!) + "\n\n" + (await stageAttachments(job, worktreeId, session.pr!));
+      // A release-notes run on a PR merged into main, in a session server.ts put on main: nothing
+      // here may be pushed — the normal preamble would say `git push origin HEAD:main`.
+      const lead =
+        session.head_ref === RELEASE_BASE && isReleaseNotesPrompt(job.prompt, session.pr!)
+          ? mergedPreamble(session.pr!)
+          : preamble(session.head_ref!, session.pr!);
+      return lead + "\n\n" + (await stageAttachments(job, worktreeId, session.pr!));
     }
     if (job.kind === NOTION_UPDATE_KIND) return job.prompt;
     return renderPrompt(job.prompt, {
@@ -701,7 +717,8 @@ export function createWorker(handle: DatabaseSync) {
     db.closeSessionRow(handle, session.key);
   }
 
-  // Closes idle sessions, and any open session whose PR is closed on GitHub — the webhook-driven
+  // Closes idle sessions, and any open session whose PR is closed on GitHub (except one merged into
+  // main, see below) — the webhook-driven
   // close (server.ts) can be missed, and PR #649 stayed open in the DB that way.
   async function sweepIdle(): Promise<void> {
     const cutoff = Date.now() - config.idleDays * 24 * 60 * 60 * 1000;
@@ -711,7 +728,11 @@ export function createWorker(handle: DatabaseSync) {
     for (const session of db.listOpenSessions(handle)) {
       if (session.pr === null) continue;
       try {
-        if ((await github.pullState(session.pr)) === "closed") await closeSession(session.key);
+        // A PR merged into main is left open, as shout's orca.yml does: release.yml may still send
+        // its `/release-notes` (and `final`) and closes the session itself with DELETE /pr/<n>.
+        // The idle cutoff above still closes it if that never comes.
+        const info = await github.pullInfo(session.pr);
+        if (info.state === "closed" && !mergedIntoRelease(info)) await closeSession(session.key);
       } catch (err) {
         console.log(`closed-PR sweep failed key=${session.key}: ${err}`);
       }

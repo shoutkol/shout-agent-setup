@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseCommand, isSafeRef, shq } from "../src/logic.ts";
+import { parseCommand, isSafeRef, shq, isReleaseNotesPrompt, acceptsOnClosedPr } from "../src/logic.ts";
+import { mergedPreamble, PREAMBLE_MARKER } from "../src/preamble.ts";
 
 test("/orca fix lint -> prompt", () => {
   assert.deepStrictEqual(parseCommand("/orca fix lint"), { type: "prompt", prompt: "fix lint" });
@@ -81,4 +82,31 @@ test("isSafeRef: shell metacharacters and git-invalid forms are refused", () => 
 test("shq single-quotes for a POSIX shell, including embedded quotes", () => {
   assert.strictEqual(shq("feat/x"), "'feat/x'");
   assert.strictEqual(shq("it's"), "'it'\\''s'");
+});
+
+test("isReleaseNotesPrompt: `/release-notes <this pr>` with optional `final`, marker or not", () => {
+  const marker = "[orca-request kind=release author=github-actions]";
+  assert.equal(isReleaseNotesPrompt("/release-notes 1207", 1207), true);
+  assert.equal(isReleaseNotesPrompt("/release-notes 1207 final", 1207), true);
+  assert.equal(isReleaseNotesPrompt(`${marker}\n/release-notes 1207`, 1207), true);
+  assert.equal(isReleaseNotesPrompt(`${marker}\n/release-notes 1207 final`, 1207), true);
+  assert.equal(isReleaseNotesPrompt("/release-notes 1208", 1207), false); // another PR's number
+  assert.equal(isReleaseNotesPrompt("/release-notes 1207 now", 1207), false);
+  assert.equal(isReleaseNotesPrompt("/release-notes", 1207), false);
+  assert.equal(isReleaseNotesPrompt("/release-notes 1207\nand also fix the typo", 1207), false);
+  assert.equal(isReleaseNotesPrompt("summarise /release-notes 1207", 1207), false);
+});
+
+test("acceptsOnClosedPr: only a release-notes prompt on a PR merged into main", () => {
+  const p = "/release-notes 5";
+  assert.equal(acceptsOnClosedPr({ state: "closed", merged: true, baseRef: "main" }, p, 5), true);
+  assert.equal(acceptsOnClosedPr({ state: "closed", merged: true, baseRef: "main" }, "fix it", 5), false);
+  assert.equal(acceptsOnClosedPr({ state: "closed", merged: false, baseRef: "main" }, p, 5), false);
+  assert.equal(acceptsOnClosedPr({ state: "closed", merged: true, baseRef: "dev" }, p, 5), false);
+});
+
+test("mergedPreamble starts with the preamble marker and never tells the agent to push", () => {
+  const text = mergedPreamble(1207);
+  assert.ok(text.startsWith(PREAMBLE_MARKER));
+  assert.doesNotMatch(text, /git push/);
 });
